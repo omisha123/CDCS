@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CDCS Cluster Dashboard</title>
+    <style>
+        /* Modern SaaS Color Palette (Light Mode / Default) */
+        :root {
+            --bg-color: #f1f5f9;
+            --card-bg: #ffffff;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #10b981;
+            --success-bg: #d1fae5;
+            --warning: #f59e0b;
+            --warning-bg: #fef3c7;
+            --danger: #ef4444;
+            --danger-bg: #fee2e2;
+            --standby: #8b5cf6;
+            --standby-bg: #ede9fe;
+            --follower-text: #0284c7;
+            --follower-bg: #e0f2fe;
+            --table-header-bg: #f8fafc;
+            --input-bg: #ffffff;
+        }
+
+        /* Dark Mode Overrides */
+        [data-theme="dark"] {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+            --primary: #3b82f6;
+            --primary-hover: #60a5fa;
+            --success: #34d399;
+            --success-bg: rgba(16, 185, 129, 0.15);
+            --warning: #fbbf24;
+            --warning-bg: rgba(245, 158, 11, 0.15);
+            --danger: #f87171;
+            --danger-bg: rgba(239, 68, 68, 0.15);
+            --standby: #a78bfa;
+            --standby-bg: rgba(139, 92, 246, 0.15);
+            --follower-text: #38bdf8;
+            --follower-bg: rgba(2, 132, 199, 0.15);
+            --table-header-bg: #0f172a;
+            --input-bg: #0f172a;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 30px;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 40px;
+        }
+        
+        header h1 { 
+            margin: 0; 
+            color: var(--primary); 
+            font-size: 2.8rem; 
+            font-weight: 700; 
+            font-family: 'Georgia', serif; 
+            font-style: italic; 
+            letter-spacing: 1px;
+        }
+
+        /* Theme Switcher */
+        .theme-switcher select {
+            padding: 8px 12px;
+            font-size: 0.9rem;
+            background-color: var(--card-bg);
+            color: var(--text-main);
+            cursor: pointer;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 25px;
+            max-width: 1500px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            border: 1px solid var(--border);
+            transition: background-color 0.3s, border-color 0.3s;
+        }
+
+        .full-width { grid-column: 1 / -1; }
+
+        h2 {
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 12px;
+            margin-top: 0;
+            margin-bottom: 20px;
+            font-size: 1.6rem;
+            color: var(--text-main);
+            font-family: 'Georgia', serif; 
+            font-style: italic;
+            letter-spacing: 0.5px;
+        }
+
+        /* Top Bar Controls */
+        .controls-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            background: var(--table-header-bg);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .controls-group { display: flex; gap: 10px; align-items: center; flex-grow: 1;}
+
+        input[type="text"], input[type="file"], select {
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.95rem;
+            outline: none;
+            background-color: var(--input-bg);
+            color: var(--text-main);
+            transition: border-color 0.2s, background-color 0.3s, color 0.3s;
+        }
+        
+        input[type="text"]:focus, select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .search-box { flex-grow: 1; max-width: 400px; }
+
+        /* Buttons */
+        button, .btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        button:hover, .btn:hover { background-color: var(--primary-hover); transform: translateY(-1px); }
+        .btn-danger { background-color: var(--danger); color: white; }
+        .btn-danger:hover { background-color: #dc2626; }
+
+        /* Tables & Badges */
+        table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 10px; }
+        th, td { 
+            border-bottom: 1px solid var(--border); 
+            padding: 14px 12px; 
+            text-align: left; 
+        }
+        th { background-color: var(--table-header-bg); color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; letter-spacing: 0.5px;}
+        tr:last-child td { border-bottom: none; }
+
+        .badge {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 700;
+            display: inline-block;
+        }
+        
+        .bg-online { background-color: var(--success-bg); color: var(--success); }
+        .bg-standby { background-color: var(--standby-bg); color: var(--standby); }
+        .bg-offline { background-color: var(--danger-bg); color: var(--danger); }
+        .bg-leader { background-color: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning); }
+        .bg-follower { background-color: var(--follower-bg); color: var(--follower-text); }
+
+        /* Storage Nodes Grid */
+        .node-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 12px; }
+        .node-card {
+            padding: 15px;
+            border-radius: 8px;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .ONLINE { background-color: var(--success); }
+        .OFFLINE { background-color: var(--danger); }
+        .backup-badge-sm { font-size: 0.7em; background-color: rgba(255,255,255,0.2); padding: 3px 6px; border-radius: 4px; margin-top: 5px; display: inline-block; }
+
+        /* Shards */
+        .shard-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+        .shard-badge {
+            background-color: var(--table-header-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px;
+            font-size: 0.8em;
+            text-align: center;
+        }
+        .shard-badge strong { display: block; color: var(--text-main); margin-bottom: 2px;}
+
+        /* Ledger */
+        ul#log-list { list-style: none; padding: 0; margin: 0; font-family: monospace; max-height: 250px; overflow-y: auto;}
+        ul#log-list li { border-bottom: 1px solid var(--border); padding: 12px; display: flex; justify-content: space-between; font-size: 0.9rem;}
+        .timestamp { color: var(--text-muted); font-size: 0.85em; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div style="width: 150px;"></div> <!-- Spacer to keep title centered -->
+        <h1>CDCS Cluster Dashboard</h1>
+        <div class="theme-switcher" style="width: 150px; text-align: right;">
+            <select id="themeSelect">
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+            </select>
+        </div>
+    </header>
+
+    <div class="dashboard-grid">
+        
+        <!-- Raft Consensus -->
+        <div class="card full-width">
+            <h2>Raft Control Plane Nodes</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Node</th>
+                        <th>Role</th>
+                        <th>IP Address</th>
+                        <th>Status</th>
+                        <th>Commit Index</th>
+                    </tr>
+                </thead>
+                <tbody id="raftTableBody">
+                    <tr><td colspan="5" style="text-align: center;">Awaiting cluster data...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <!-- Cache Stampede Stats -->
+        <div class="card" style="display: flex; justify-content: space-around; align-items: center; text-align: center; flex-wrap: wrap; gap: 16px;">
+            <div>
+                <h3 style="margin: 0; color: var(--text-muted); font-size: 0.9rem; text-transform: uppercase;">Total Downloads</h3>
+                <div id="statTotal" style="font-size: 2.5rem; font-weight: 800; color: var(--primary);">0</div>
+            </div>
+            <div style="width: 1px; height: 50px; background: var(--border);"></div>
+            <div>
+                <h3 style="margin: 0; color: var(--text-muted); font-size: 0.9rem; text-transform: uppercase;">Total Views</h3>
+                <div id="statViews" style="font-size: 2.5rem; font-weight: 800; color: var(--standby);">0</div>
+            </div>
+            <div style="width: 1px; height: 50px; background: var(--border);"></div>
+            <div>
+                <h3 style="margin: 0; color: var(--text-muted); font-size: 0.9rem; text-transform: uppercase;">Deduped Requests</h3>
+                <div id="statDeduped" style="font-size: 2.5rem; font-weight: 800; color: var(--success);">0</div>
+            </div>
+            <div style="width: 1px; height: 50px; background: var(--border);"></div>
+            <div>
+                <h3 style="margin: 0; color: var(--text-muted); font-size: 0.9rem; text-transform: uppercase;">2Q Cache Hit Rate</h3>
+                <div id="statCacheHitRate" style="font-size: 2.5rem; font-weight: 800; color: var(--success);">0%</div>
+            </div>
+            <div style="width: 1px; height: 50px; background: var(--border);"></div>
+            <div>
+                <h3 style="margin: 0; color: var(--text-muted); font-size: 0.9rem; text-transform: uppercase;">Mem / Disk / Miss</h3>
+                <div id="statCacheBreakdown" style="font-size: 1.1rem; font-weight: 700; color: var(--text-muted);">0 / 0 / 0</div>
+            </div>
+        </div>
+        <!-- 2Q Cache Inspector -->
+        <div class="card full-width">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 style="margin-bottom: 0; border: none;">Live 2Q Cache Inspector</h2>
+                <select id="nodeSelect" style="width: 200px;">
+                    <option value="">Select a Node...</option>
+                </select>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
+                <!-- A1in -->
+                <div style="background: var(--bg-color); padding: 15px; border-radius: 8px; border: 1px solid var(--border);">
+                    <h4 style="margin-top: 0; color: var(--primary);">A1in (FIFO / Probation)</h4>
+                    <ul id="a1inList" style="list-style: none; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; max-height: 250px; overflow-y: auto;"></ul>
+                </div>
+                <!-- Am -->
+                <div style="background: var(--bg-color); padding: 15px; border-radius: 8px; border: 1px solid var(--border);">
+                    <h4 style="margin-top: 0; color: var(--success);">Am (LRU / Hot Data)</h4>
+                    <ul id="amList" style="list-style: none; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; max-height: 250px; overflow-y: auto;"></ul>
+                </div>
+                <!-- A1out -->
+                <div style="background: var(--bg-color); padding: 15px; border-radius: 8px; border: 1px solid var(--border);">
+                    <h4 style="margin-top: 0; color: var(--warning);">A1out (Ghost / Watchlist)</h4>
+                    <ul id="a1outList" style="list-style: none; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; max-height: 250px; overflow-y: auto;"></ul>
+                </div>
+            </div>
+        </div>
+        <!-- File Management -->
+        <div class="card full-width">
+            <h2>Stored Files & Shard Distribution</h2>
+            
+            <div class="controls-bar">
+                <div class="controls-group">
+                    <input type="text" id="searchInput" class="search-box" placeholder="Search by File Name or ID...">
+                    
+                    <select id="typeSelect">
+                        <option value="all">All File Types</option>
+                        <option value="document"> Documents</option>
+                        <option value="image"> Images</option>
+                        <option value="video"> Videos</option>
+                        <option value="other"> Other</option>
+                    </select>
+
+                    <select id="sortSelect">
+                        <option value="id_asc">Sort: ID (A - Z)</option>
+                        <option value="name_asc">Sort: Name (A - Z)</option>
+                        <option value="date_desc">Sort: Newest First</option>
+                        <option value="date_asc">Sort: Oldest First</option>
+                        <option value="size_asc">Sort: Size (Smallest)</option>
+                        <option value="size_desc">Sort: Size (Largest)</option>
+                    </select>
+                </div>
+            </div>
+
+            <form id="uploadForm" style="display: flex; gap: 10px; margin-bottom: 20px;">
+                <input type="file" id="fileInput" multiple required style="flex-grow: 1;">
+                <input type="text" id="fileId" placeholder="Custom File ID (single file only)">
+                <button type="submit">Upload File(s)</button>
+            </form>
+
+            <table>
+               <thead>
+                    <tr>
+                        <th style="width: 5%;">#</th>
+                        <th style="width: 12%;">ID</th>
+                        <th style="width: 15%;">Name</th>
+                        <th style="width: 10%;">Uploaded</th>
+                        <th style="width: 8%;">Size</th>
+                        <th style="width: 35%;">Shard Mapping</th>
+                        <th style="width: 15%;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="filesTableBody"></tbody>
+            </table>
+        </div>
+
+        <!-- Storage Nodes -->
+        <div class="card">
+            <h2>Physical Storage Plane Status</h2>
+            <div id="nodes" class="node-container">Loading...</div>
+        </div>
+
+        <!-- Log Ledger -->
+        <div class="card">
+            <h2>Consensus Log Ledger</h2>
+            <ul id="log-list">
+                <li><span>System initialized. Waiting for events...</span></li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // --- Theme Engine ---
+        const themeSelect = document.getElementById('themeSelect');
+
+        function applyTheme(theme) {
+            if (theme === 'system') {
+                const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+            } else {
+                document.documentElement.setAttribute('data-theme', theme);
+            }
+        }
+
+        // Initialize Theme from LocalStorage
+        const savedTheme = localStorage.getItem('cdcs-theme') || 'system';
+        themeSelect.value = savedTheme;
+        applyTheme(savedTheme);
+
+        // Listen for dropdown changes
+        themeSelect.addEventListener('change', (e) => {
+            const newTheme = e.target.value;
+            localStorage.setItem('cdcs-theme', newTheme);
+            applyTheme(newTheme);
+        });
+
+        // Listen for OS-level changes if set to System
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            if (themeSelect.value === 'system') {
+                applyTheme('system');
+            }
+        });
+
+
+        // --- Core Application Logic ---
+        let previousCommitIndex = null;
+        let allFiles = []; 
+        let currentSearchQuery = '';
+        let currentTypeFilter = 'all';
+        let currentSortMethod = 'id_asc';
+
+        function formatBytes(bytes, decimals = 2) {
+            if (!+bytes) return '0 Bytes';
+            const k = 1024, dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+        }
+
+        function getFileType(filename) {
+            const ext = filename.split('.').pop().toLowerCase();
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
+            if (['pdf', 'doc', 'docx', 'txt', 'csv', 'md'].includes(ext)) return 'document';
+            if (['mp4', 'mkv', 'avi', 'mov'].includes(ext)) return 'video';
+            return 'other';
+        }
+
+        document.getElementById('searchInput').addEventListener('input', (e) => {
+            currentSearchQuery = e.target.value.toLowerCase();
+            renderFiles();
+        });
+        document.getElementById('typeSelect').addEventListener('change', (e) => {
+            currentTypeFilter = e.target.value;
+            renderFiles();
+        });
+        document.getElementById('sortSelect').addEventListener('change', (e) => {
+            currentSortMethod = e.target.value;
+            renderFiles();
+        });
+
+        async function fetchNodes() {
+            try {
+                const res = await fetch('/nodes');
+                const nodes = await res.json();
+                const container = document.getElementById('nodes');
+                container.innerHTML = '';
+                nodes.sort((a, b) => a.id.localeCompare(b.id)).forEach(n => {
+                    const div = document.createElement('div');
+                    div.className = `node-card ${n.status}`;
+                    div.innerHTML = `<div style="font-size: 1.1em">${n.id}</div><div style="font-size: 0.85em; font-weight: normal; margin-top: 4px; font-family: 'Georgia', serif; font-style: italic;">${n.status}</div>`;
+                    if (n.is_backup) div.innerHTML += `<div class="backup-badge-sm">BACKUP</div>`;
+                    container.appendChild(div);
+                });
+            } catch (err) { console.error('Failed to load nodes'); }
+        }
+
+        async function fetchFiles() {
+            try {
+                const res = await fetch('/files');
+                allFiles = await res.json() || [];
+                renderFiles();
+            } catch (err) { console.error('Failed to load files'); }
+        }
+
+       function renderFiles() {
+            const tbody = document.getElementById('filesTableBody');
+            tbody.innerHTML = '';
+
+            let filtered = allFiles.filter(f => {
+                const matchesSearch = f.name.toLowerCase().includes(currentSearchQuery) || f.id.toLowerCase().includes(currentSearchQuery);
+                const matchesType = currentTypeFilter === 'all' || getFileType(f.name) === currentTypeFilter;
+                return matchesSearch && matchesType;
+            });
+
+            // Added date sorting logic
+            filtered.sort((a, b) => {
+                if (currentSortMethod === 'name_asc') return a.name.localeCompare(b.name);
+                if (currentSortMethod === 'size_asc') return a.size - b.size;
+                if (currentSortMethod === 'size_desc') return b.size - a.size;
+                if (currentSortMethod === 'date_asc') return (a.uploaded_at || 0) - (b.uploaded_at || 0);
+                if (currentSortMethod === 'date_desc') return (b.uploaded_at || 0) - (a.uploaded_at || 0);
+                return a.id.localeCompare(b.id); 
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding: 30px; color: var(--text-muted);">No matching files found.</td></tr>`;
+                return;
+            }
+
+            // Added index to the loop for Serial No
+            filtered.forEach((f, index) => {
+                const tr = document.createElement('tr');
+                let shardBadgesHtml = '<div class="shard-grid">';
+                let mappingsList = f.mappings || [];
+                
+                if (mappingsList.length > 0) {
+                    mappingsList.forEach(m => {
+                        shardBadgesHtml += `<div class="shard-badge"><strong>${m.shard_id}</strong>➔ ${m.node_id}</div>`;
+                    });
+                } else {
+                    shardBadgesHtml += '<div>No Shards Mapping Available</div>';
+                }
+                shardBadgesHtml += '</div>';
+
+              const pinIcon = f.is_pinned ? '⭐' : '☆';
+              const pinTitle = f.is_pinned ? 'Unpin File' : 'Pin File (Protect from deletion)';
+              
+              // Format the Unix timestamp into a readable date string
+              const uploadDate = f.uploaded_at ? new Date(f.uploaded_at * 1000).toLocaleDateString() : 'Legacy';
+              const serialNo = index + 1;
+              
+              tr.innerHTML = `
+                  <td>${serialNo}</td>
+                  <td><strong>${f.id}</strong></td>
+                  <td style="word-break: break-all;">${f.is_pinned ? '⭐ ' : ''}${f.name}</td>
+                  <td style="color: var(--text-muted); font-size: 0.9em;">${uploadDate}</td>
+                  <td><span class="badge">${formatBytes(f.size)}</span></td>
+                  <td>${shardBadgesHtml}</td>
+                  <td>
+                      <button onclick="togglePin('${f.id}')" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0;" title="${pinTitle}">${pinIcon}</button>
+                      <button onclick="window.open('/view?id=${encodeURIComponent(f.id)}', '_blank')" style="margin-left: 10px; margin-right: 5px;" title="View file">👁</button>
+                      <button onclick="window.location.href='/download?id=${encodeURIComponent(f.id)}'" style="margin-right: 5px;" title="Download file">↓</button> 
+                      <button class="btn-danger" onclick="deleteFile('${f.id}')">✗</button>
+                  </td>
+              `;
+              tbody.appendChild(tr);
+            });
+        }
+        async function togglePin(id) {
+        const res = await fetch(`/pin?id=${encodeURIComponent(id)}`, { method: 'POST' });
+        if (res.ok) {
+                fetchFiles(); // Instantly refresh table to display the updated star
+            } else {
+               alert('Failed to toggle pin status.');
+            }
+        }
+     
+        function addLogEntry(message) {
+            const logList = document.getElementById('log-list');
+            if (logList.innerHTML.includes("Waiting for events")) logList.innerHTML = ''; 
+            
+            const li = document.createElement('li');
+            li.innerHTML = `<span>${message}</span> <span class="timestamp">${new Date().toLocaleTimeString()}</span>`;
+            logList.insertBefore(li, logList.firstChild);
+            
+            if (logList.children.length > 8) logList.removeChild(logList.lastChild);
+        }
+        async function fetchStats() {
+            try {
+                const res = await fetch('/stats');
+                const stats = await res.json();
+                document.getElementById('statTotal').innerText = stats.download_requests || 0;
+                document.getElementById('statViews').innerText = stats.total_views || 0; // <--- Add this line
+                document.getElementById('statDeduped').innerText = stats.deduped_requests || 0;
+            } catch (err) { console.error('Failed to load stats'); }
+        }
+
+        async function fetchCacheStats() {
+            try {
+                const res = await fetch('/cache-stats');
+                const data = await res.json();
+                const t = data.total || {};
+                const memHits = t.mem_hits || 0;
+                const diskHits = t.disk_hits || 0;
+                const misses = t.misses || 0;
+                document.getElementById('statCacheHitRate').innerText = (data.hit_rate_pct || 0).toFixed(1) + '%';
+                document.getElementById('statCacheBreakdown').innerText = `${memHits} / ${diskHits} / ${misses}`;
+            } catch (err) { console.error('Failed to load cache stats'); }
+        }
+
+        fetchStats(); // Call it once on load
+        fetchCacheStats();
+        let cacheContentsData = {};
+
+        async function fetchCacheInspector() {
+            try {
+                const res = await fetch('/cache-inspect');
+                cacheContentsData = await res.json();
+                
+                const select = document.getElementById('nodeSelect');
+                const currentValue = select.value;
+                
+                // Populate node dropdown if it's empty
+                if (select.options.length <= 1 && Object.keys(cacheContentsData).length > 0) {
+                    select.innerHTML = ''; // Clear default
+                    Object.keys(cacheContentsData).sort().forEach(nodeId => {
+                        const opt = document.createElement('option');
+                        opt.value = nodeId;
+                        opt.textContent = nodeId;
+                        select.appendChild(opt);
+                    });
+                    if (!currentValue) select.value = Object.keys(cacheContentsData).sort()[0];
+                }
+                
+                renderCacheInspector();
+            } catch (err) { console.error('Failed to load cache inspector'); }
+        }
+
+        function renderCacheInspector() {
+            const nodeId = document.getElementById('nodeSelect').value;
+            if (!nodeId || !cacheContentsData[nodeId]) return;
+
+            const data = cacheContentsData[nodeId];
+            
+            const renderList = (id, items) => {
+                const ul = document.getElementById(id);
+                if (!items || items.length === 0) {
+                    ul.innerHTML = '<li style="color: var(--text-muted); padding: 4px 0;">Empty</li>';
+                    return;
+                }
+                ul.innerHTML = items.map(i => `<li style="padding: 4px 0; border-bottom: 1px solid var(--border);">${i}</li>`).join('');
+            };
+
+            renderList('a1inList', data.a1in);
+            renderList('amList', data.am);
+            renderList('a1outList', data.a1out);
+        }
+
+        document.getElementById('nodeSelect').addEventListener('change', renderCacheInspector);
+        async function fetchRaftStatus() {
+            try {
+                const res = await fetch('/raft/status');
+                let data = await res.json();
+                data.sort((a, b) => a.id.localeCompare(b.id));
+
+                const tbody = document.getElementById('raftTableBody');
+                let htmlBuffer = '';
+                let highestCommit = 0;
+
+                data.forEach(node => {
+                    const currentCommitIndex = parseInt(node.commit_index, 10) || 0;
+                    if (currentCommitIndex > highestCommit) highestCommit = currentCommitIndex;
+
+                    let roleText = node.state.charAt(0).toUpperCase() + node.state.slice(1).toLowerCase();
+                    let roleBadge = "bg-follower";
+                    let statusText = "Online";
+                    let statusBadge = "bg-online";
+                    let ipAddr = node.address || "Unknown IP";
+
+                    if (roleText === "Leader") {
+                        roleBadge = "bg-leader";
+                    } else if (node.state === "Backup") {
+                        roleText = "Standby";
+                        roleBadge = "bg-standby";
+                        statusText = "Standby";
+                        statusBadge = "bg-standby";
+                    } else if (node.state === "Dead") {
+                        roleText = "Offline";
+                        roleBadge = "bg-offline";
+                        statusText = "Offline";
+                        statusBadge = "bg-offline";
+                    }
+
+                    htmlBuffer += `
+                        <tr>
+                            <td><strong>${node.id}</strong></td>
+                            <td><span class="badge ${roleBadge}">${roleText}</span></td>
+                            <td style="font-family: monospace; color: var(--text-muted);">${ipAddr}</td>
+                            <td><span class="badge ${statusBadge}">${statusText}</span></td>
+                            <td style="font-family: monospace; font-weight: bold;">${node.commit_index}</td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = htmlBuffer;
+
+                if (previousCommitIndex !== null && highestCommit > previousCommitIndex) {
+                    const diff = highestCommit - previousCommitIndex;
+                    addLogEntry(`[TX_COMMIT] ${diff} op(s) synced to global metadata ledger.`);
+                }
+                previousCommitIndex = highestCommit;
+            } catch (error) { console.error("Raft fetch failed"); }
+        }
+
+        async function deleteFile(id) {
+            if (!confirm(`Delete '${id}' permanently from the cluster?`)) return;
+            const res = await fetch(`/delete?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+            if (res.ok) fetchFiles();
+            else alert('Failed to delete file.');
+        }
+
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = e.target.querySelector('button');
+            const files = document.getElementById('fileInput').files;
+            const customId = document.getElementById('fileId').value;
+
+            if (files.length === 0) return;
+
+            // A single custom ID only makes sense for a single file - using
+            // it for a whole batch would make every file collide on the
+            // same fileID and trip the backend's duplicate-ID rejection.
+            if (files.length > 1 && customId) {
+                alert('Custom File ID is only used when uploading a single file. It will be ignored for this batch - each file will use its own filename as its ID.');
+            }
+
+            btn.disabled = true;
+            const failures = [];
+
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                btn.textContent = `Uploading ${i + 1} of ${files.length}: ${file.name}...`;
+
+                const formData = new FormData();
+                formData.append('file', file);
+                // Only pass the custom ID through when it's a true single-file upload,
+                // otherwise leave it blank so the backend defaults to the filename
+                // (exact same per-file behavior as before, just looped).
+                formData.append('id', files.length === 1 ? customId : '');
+
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                if (!res.ok) {
+                    failures.push(`${file.name}: ${await res.text()}`);
+                }
+            }
+
+            if (failures.length > 0) {
+                alert(`${files.length - failures.length} of ${files.length} file(s) uploaded successfully.\n\nFailed:\n${failures.join('\n')}`);
+            }
+
+            e.target.reset();
+            fetchFiles();
+
+            btn.textContent = 'Upload File(s)';
+            btn.disabled = false;
+        });
+
+        fetchNodes();
+        fetchFiles();
+        fetchRaftStatus();
+        fetchCacheInspector(); // <--- ADDED: Fetches inspector instantly on load
+        
+        // <--- ADDED: fetchCacheInspector() included inside the interval loop below
+        let lastEventTime = 0;
+async function fetchEvents() {
+    try {
+        const res = await fetch('/events');
+        const events = await res.json() || [];
+        const logList = document.getElementById('log-list');
+        if (events.length === 0) return;
+        logList.innerHTML = events.slice().reverse().slice(0, 30).map(e =>
+            `<li><span>${e.message}</span> <span class="timestamp">${new Date(e.time * 1000).toLocaleTimeString()}</span></li>`
+        ).join('');
+    } catch (err) { console.error('Failed to load events'); }
+}
+fetchEvents();
+        setInterval(() => { fetchNodes(); fetchFiles(); fetchCacheStats(); fetchCacheInspector(); fetchEvents(); }, 3000);
+        setInterval(fetchRaftStatus, 1000);
+    </script>
+</body>
+</html>

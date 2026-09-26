@@ -1,0 +1,115 @@
+syntax = "proto3";
+package cdcs;
+option go_package = "./cdcspb";
+
+// Internal Mesh (Node-to-Node Shard Transfers)
+service ReplicationService {
+    rpc PutShard (ShardRequest) returns (ShardResponse);
+    rpc GetShard (ShardRequest) returns (ShardResponse);
+    rpc DeleteShard (DeleteRequest) returns (DeleteResponse);
+}
+
+// Client-Facing & Orchestrator Control Plane
+service CacheService {
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc Put (PutRequest) returns (PutResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    
+    // Allows the orchestrator laptop to remotely fetch live 2Q memory queues from physical PCs
+    rpc InspectCache (InspectRequest) returns (InspectResponse);
+    rpc GetCacheStats (StatsRequest) returns (StatsResponse);
+}
+// Add these messages at the bottom of the file
+message StatsRequest {}
+
+message StatsResponse {
+    int64 mem_hits = 1;
+    int64 disk_hits = 2;
+    int64 misses = 3;
+}
+
+// --- CORE CACHE MESSAGES ---
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    bytes data = 1;
+    bool success = 2;
+}
+
+message PutRequest {
+    string key = 1;
+    bytes data = 2;
+}
+
+message PutResponse {
+    bool success = 1;
+}
+
+message DeleteRequest {
+    string key = 1;
+    int32 shard_index = 2;
+}
+
+message DeleteResponse {
+    bool success = 1;
+}
+
+// --- INTERNAL SHARD REPLICATION MESSAGES ---
+
+message ShardRequest {
+    string file_id = 1;
+    int32 shard_index = 2;
+    bytes data = 3; 
+}
+
+message ShardResponse {
+    bytes data = 1; 
+    bool success = 2;
+}
+
+// --- LIVE CACHE INSPECTOR MESSAGES ---
+
+message InspectRequest {}
+
+message InspectResponse {
+    repeated string a1in = 1;
+    repeated string am = 2;
+    repeated string a1out = 3;
+}
+
+// --- RAFT CONSENSUS & METADATA MESSAGES ---
+
+message ShardMapping {
+    int32 shard_index = 1;
+    string node_id = 2;
+}
+
+message FileMeta {
+    string id = 1;
+    string name = 2;
+    int64 size = 3;
+    repeated ShardMapping mappings = 4;
+    map<int32, string> chunk_map = 5;
+    map<int32, string> backup_map = 6;
+    map<int32, string> home_map = 7;
+    int32 data_shards = 8;
+    int32 parity_shards = 9;
+    int64 shard_size = 10;
+    map<int32, string> checksum_map = 11;
+    int64 last_accessed = 12;
+    bool is_pinned = 13;
+}
+
+message LogCommand {
+    string operation = 1;
+    bytes payload = 2;
+}
+
+message NodeStatus {
+    string id = 1;
+    string status = 2;
+    bool is_backup = 3;
+}

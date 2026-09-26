@@ -1,0 +1,218 @@
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cdcs-node
+    environment:
+      - ROLE=orchestrator
+      - PING_TIMEOUT_MS=${PING_TIMEOUT_MS:-200}
+      - STORAGE_FAILOVER_STREAK=${STORAGE_FAILOVER_STREAK:-3}
+      - RAFT_FAILOVER_STREAK=${RAFT_FAILOVER_STREAK:-3}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./cluster.json:/app/cluster.json
+    depends_on:
+      - node-01
+      - node-02
+      - node-03
+      - node-04
+      - node-05
+      - node-06
+      - backup-01
+      - backup-02
+      - raft-01
+      - raft-02
+      - raft-03
+      - raft-04
+      - raft-05
+      - raft-06
+      - raft-07
+
+  node-01:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-01
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./data/node-01:/app/storage
+
+  node-02:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-02
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50052:50051"
+    volumes:
+      - ./data/node-02:/app/storage
+
+  node-03:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-03
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50053:50051"
+    volumes:
+      - ./data/node-03:/app/storage
+
+  node-04:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-04
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50054:50051"
+    volumes:
+      - ./data/node-04:/app/storage
+
+  node-05:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-05
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50055:50051"
+    volumes:
+      - ./data/node-05:/app/storage
+
+  node-06:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-06
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50056:50051"
+    volumes:
+      - ./data/node-06:/app/storage
+
+  backup-01:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-07
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50057:50051"
+    volumes:
+      - ./data/backup-01:/app/storage
+
+  backup-02:
+    image: cdcs-node
+    environment:
+      - ROLE=storage
+      - NODE_ID=Node-08
+      - BIND_IP=0.0.0.0:50051
+      - CACHE_CAPACITY=${CACHE_CAPACITY:-500}
+    ports:
+      - "50058:50051"
+    volumes:
+      - ./data/backup-02:/app/storage
+
+  raft-01:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-01
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-01:60051
+      - RAFT_PEERS=Raft-01=raft-01:60051,Raft-02=raft-02:60051,Raft-03=raft-03:60051,Raft-04=raft-04:60051,Raft-05=raft-05:60051
+    ports:
+      - "60051:60051"
+    volumes:
+      - ./data/raft-01:/app/raft
+
+  raft-02:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-02
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-02:60051
+      - RAFT_PEERS=Raft-01=raft-01:60051,Raft-02=raft-02:60051,Raft-03=raft-03:60051,Raft-04=raft-04:60051,Raft-05=raft-05:60051
+    ports:
+      - "60052:60051"
+    volumes:
+      - ./data/raft-02:/app/raft
+
+  raft-03:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-03
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-03:60051
+      - RAFT_PEERS=Raft-01=raft-01:60051,Raft-02=raft-02:60051,Raft-03=raft-03:60051,Raft-04=raft-04:60051,Raft-05=raft-05:60051
+    ports:
+      - "60053:60051"
+    volumes:
+      - ./data/raft-03:/app/raft
+
+  raft-04:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-04
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-04:60051
+      - RAFT_PEERS=Raft-01=raft-01:60051,Raft-02=raft-02:60051,Raft-03=raft-03:60051,Raft-04=raft-04:60051,Raft-05=raft-05:60051
+    ports:
+      - "60054:60051"
+    volumes:
+      - ./data/raft-04:/app/raft
+
+  raft-05:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-05
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-05:60051
+      - RAFT_PEERS=Raft-01=raft-01:60051,Raft-02=raft-02:60051,Raft-03=raft-03:60051,Raft-04=raft-04:60051,Raft-05=raft-05:60051
+    ports:
+      - "60055:60051"
+    volumes:
+      - ./data/raft-05:/app/raft
+
+  raft-06:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-06
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-06:60051
+      - RAFT_SEED=raft-01:60051
+    ports:
+      - "60056:60051"
+    volumes:
+      - ./data/raft-06:/app/raft
+
+  raft-07:
+    image: cdcs-node
+    environment:
+      - ROLE=raft
+      - NODE_ID=Raft-07
+      - BIND_IP=0.0.0.0:60051
+      - ADVERTISE_ADDR=raft-07:60051
+      - RAFT_SEED=raft-01:60051
+    ports:
+      - "60057:60051"
+    volumes:
+      - ./data/raft-07:/app/raft
