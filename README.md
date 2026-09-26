@@ -404,7 +404,7 @@ The exact structure may differ between development and scaled deployment version
 
 For detailed architecture, deployment instructions, APIs, fault-tolerance experiments, and implementation details:
 
-**📚 [CDCS Documentation Wiki](https://github.com/omisha123/Consistent-Distributed-Cache-Systems/wiki)**
+**📚 [CDCS Documentation Wiki](https://github.com/omisha123/CDCS/wiki/Documentation)**
 
 ---
 
