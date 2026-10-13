@@ -89,14 +89,32 @@ type Backend struct {
 	eventsMu  sync.Mutex
 	// Used for chaos testing to simulate network partitions without shutting down physical PCs
 	killedNodes map[string]bool
+	// Simulated raft partitions (chaos testing): the orchestrator treats these
+	// raft nodes as unreachable even though the processes keep running.
+	killedRaft map[string]bool
 
 	// Raft standby auto-promotion bookkeeping.
 	raftDeadStreak map[string]int  // main raft node ID -> consecutive dead health-check count
 	raftPromoted   map[string]bool // main raft node ID -> already had a standby promoted in its place
+	raftLeaderAPI  string          // last raft API address that accepted a write (leader cache)
 	usedBackups    map[string]bool // standby raft node ID -> already promoted (don't reuse)
 
 	// Storage-node auto-failover bookkeeping (mirrors the raft one above).
 	storageDeadStreak map[string]int // storage node ID -> consecutive unreachable health-check count
+
+	// Counters/histograms surfaced by HandleMetrics (metrics.go).
+	sfInflight             int64
+	shardFetchSuccessTotal int64
+	shardFetchFailTotal    int64
+	reconstructTotal       int64
+	uploadRequestsTotal    int64
+	uploadSuccessTotal     int64
+	downloadSuccessTotal   int64
+	killEventsTotal        int64
+	reviveEventsTotal      int64
+	sweeperEvictionsTotal  int64
+	downloadLatencyMs      *Histogram
+	uploadLatencyMs        *Histogram
 }
 
 type LogEvent struct {
@@ -206,13 +224,21 @@ func NewBackend(configPath string) *Backend {
 		cc:                NewClusterClient(allStorageNodes),
 		sfGroup:           NewSingleFlightGroup(),
 		killedNodes:       make(map[string]bool),
+		killedRaft:        make(map[string]bool),
 		raftDeadStreak:    make(map[string]int),
 		raftPromoted:      make(map[string]bool),
 		usedBackups:       make(map[string]bool),
 		storageDeadStreak: make(map[string]int),
+		downloadLatencyMs: NewHistogram([]float64{
+			1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000,
+		}),
+		uploadLatencyMs: NewHistogram([]float64{
+			1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000,
+		}),
 	}
 
 	b.loadMetadataFromDB()
+	b.loadRaftTopology()
 	b.recoverIncompleteUploads()
 	b.startUnifiedSweeper()
 	b.startRaftFailoverWatcher()
@@ -261,56 +287,179 @@ func (b *Backend) commitUploadWAL(fileID string) {
 	_ = b.db.Delete(b.walKey(fileID), pebble.Sync)
 }
 
-// saveMeta persists meta locally for the dashboard, then broadcasts to the physical Raft network.
-func (b *Backend) saveMeta(fileID string, meta FileMeta) error {
+// saveMetaLocal writes meta to the orchestrator's Pebble DB and in-memory map only.
+func (b *Backend) saveMetaLocal(fileID string, meta FileMeta) {
 	metaBytes, _ := json.Marshal(meta)
-
-	// 1. Save locally to Orchestrator's Pebble DB
 	_ = b.db.Set([]byte("file:"+fileID), metaBytes, pebble.Sync)
 
 	b.mu.Lock()
 	b.fileMeta[fileID] = meta
 	b.mu.Unlock()
+}
 
-	cmd := LogCommand{
-		Operation: "SET_META",
-		Payload:   metaBytes,
-	}
+// saveMeta is LOCAL-FIRST: it updates the orchestrator's own copy, then
+// commits to Raft and returns the Raft error. Use it for system-initiated
+// updates (reroute, restore, last-accessed) where the local view must move
+// even if Raft is temporarily unavailable. Callers must check the error.
+func (b *Backend) saveMeta(fileID string, meta FileMeta) error {
+	b.saveMetaLocal(fileID, meta)
+
+	metaBytes, _ := json.Marshal(meta)
+	cmd := LogCommand{Operation: "SET_META", Payload: metaBytes}
 
 	if err := b.raftApply(cmd); err != nil {
 		fmt.Printf("[Raft] SET_META failed for %s: %v\n", fileID, err)
+		return fmt.Errorf("raft commit failed: %w", err)
+	}
+	return nil
+}
+
+// saveMetaRaftFirst is RAFT-FIRST: the local copy is only written after the
+// Raft commit succeeds, so a failure leaves nothing behind locally. Use it
+// for user-initiated changes (upload, pin) so a failed commit is a clean
+// failure instead of a local copy that is ahead of Raft.
+func (b *Backend) saveMetaRaftFirst(fileID string, meta FileMeta) error {
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal meta: %w", err)
 	}
 
+	cmd := LogCommand{Operation: "SET_META", Payload: metaBytes}
+	if err := b.raftApply(cmd); err != nil {
+		fmt.Printf("[Raft] SET_META failed for %s: %v\n", fileID, err)
+		return fmt.Errorf("raft commit failed: %w", err)
+	}
+
+	b.saveMetaLocal(fileID, meta)
 	return nil
 }
 
 func (b *Backend) raftApply(cmd LogCommand) error {
 	b.mu.RLock()
-	raftNodes := make([]string, 0, len(b.config.RaftNodes))
-
-	for _, addr := range b.config.RaftNodes {
-		raftNodes = append(raftNodes, addr)
+	cachedLeader := b.raftLeaderAPI
+	live := make([]string, 0, len(b.config.RaftNodes))
+	dead := make([]string, 0)
+	for id, addr := range b.config.RaftNodes {
+		if b.killedRaft[id] {
+			continue // simulated partition: don't even try it
+		}
+		apiAddr := deriveAPIAddr(addr)
+		// Nodes the watcher currently counts as dead go last, not first.
+		if b.raftDeadStreak[id] > 0 {
+			dead = append(dead, apiAddr)
+		} else {
+			live = append(live, apiAddr)
+		}
 	}
-
 	b.mu.RUnlock()
 
-	var lastErr error
-
-	for _, raftAddr := range raftNodes {
-		apiAddr := deriveAPIAddr(raftAddr)
-
-		if err := SubmitLogCommand(apiAddr, cmd); err == nil {
-			return nil
-		} else {
-			lastErr = err
+	// Order: cached leader, then healthy nodes, then dead ones as a last resort.
+	candidates := make([]string, 0, len(live)+len(dead)+1)
+	if cachedLeader != "" {
+		candidates = append(candidates, cachedLeader)
+	}
+	for _, a := range append(live, dead...) {
+		if a != cachedLeader {
+			candidates = append(candidates, a)
 		}
 	}
 
-	if lastErr == nil {
+	if len(candidates) == 0 {
 		return fmt.Errorf("no Raft nodes configured")
 	}
 
+	var lastErr error
+	for _, apiAddr := range candidates {
+		err := SubmitLogCommand(apiAddr, cmd)
+		if err == nil {
+			b.mu.Lock()
+			b.raftLeaderAPI = apiAddr
+			b.mu.Unlock()
+			return nil
+		}
+		lastErr = err
+
+		// The cached address failed: forget it so we don't retry it first.
+		if apiAddr == cachedLeader {
+			b.mu.Lock()
+			if b.raftLeaderAPI == cachedLeader {
+				b.raftLeaderAPI = ""
+			}
+			b.mu.Unlock()
+		}
+	}
+
 	return lastErr
+}
+
+const raftTopologyKey = "raft_topology"
+
+// raftTopology is the part of the orchestrator's raft view that failover
+// changes at runtime. It is persisted so an orchestrator restart doesn't
+// reload cluster.json and forget that a standby replaced a dead node.
+type raftTopology struct {
+	RaftNodes   map[string]string `json:"raft_nodes"`
+	Promoted    map[string]bool   `json:"promoted"`
+	UsedBackups map[string]bool   `json:"used_backups"`
+}
+
+// persistRaftTopologyLocked saves the current raft topology. The caller
+// must already hold b.mu.
+func (b *Backend) persistRaftTopologyLocked() {
+	data, err := json.Marshal(raftTopology{
+		RaftNodes:   b.config.RaftNodes,
+		Promoted:    b.raftPromoted,
+		UsedBackups: b.usedBackups,
+	})
+	if err != nil {
+		fmt.Printf("[Raft] could not marshal topology: %v\n", err)
+		return
+	}
+	if err := b.db.Set([]byte(raftTopologyKey), data, pebble.Sync); err != nil {
+		fmt.Printf("[Raft] could not persist topology: %v\n", err)
+	}
+}
+
+// loadRaftTopology overlays a previously saved topology on top of
+// cluster.json. Set RESET_RAFT_TOPOLOGY=1 to discard it (for example after
+// editing raft addresses in cluster.json on purpose).
+func (b *Backend) loadRaftTopology() {
+	key := []byte(raftTopologyKey)
+
+	if os.Getenv("RESET_RAFT_TOPOLOGY") == "1" {
+		_ = b.db.Delete(key, pebble.Sync)
+		return
+	}
+
+	val, closer, err := b.db.Get(key)
+	if err != nil {
+		return // nothing saved yet
+	}
+	defer closer.Close()
+
+	var t raftTopology
+	if err := json.Unmarshal(val, &t); err != nil || len(t.RaftNodes) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.RaftNodes = t.RaftNodes
+	if t.Promoted != nil {
+		b.raftPromoted = t.Promoted
+	}
+	if t.UsedBackups != nil {
+		b.usedBackups = t.UsedBackups
+	}
+	fmt.Printf("[Raft] restored saved topology (%d voters)\n", len(t.RaftNodes))
+}
+
+// isNodeKilled reports whether a storage node is under a simulated partition.
+// killedNodes is written by HandleKillNode, so reads must be locked.
+func (b *Backend) isNodeKilled(nodeID string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.killedNodes[nodeID]
 }
 
 func (b *Backend) recoverIncompleteUploads() {
@@ -408,8 +557,12 @@ func (b *Backend) HandleNodes(w http.ResponseWriter, r *http.Request) {
 func (b *Backend) fetchRaftStatuses() map[string]map[string]interface{} {
 	b.mu.RLock()
 	raftNodes := make(map[string]string, len(b.config.RaftNodes))
+	killed := make(map[string]bool, len(b.killedRaft))
 	for id, addr := range b.config.RaftNodes {
 		raftNodes[id] = addr
+		if b.killedRaft[id] {
+			killed[id] = true
+		}
 	}
 	b.mu.RUnlock()
 
@@ -427,6 +580,15 @@ func (b *Backend) fetchRaftStatuses() map[string]map[string]interface{} {
 				"address":      raftAddr,
 				"state":        "Dead",
 				"commit_index": uint64(0),
+				"term":         uint64(0),
+			}
+
+			// Simulated partition: report Dead without contacting the node.
+			if killed[nodeID] {
+				mu.Lock()
+				results[nodeID] = statusEntry
+				mu.Unlock()
+				return
 			}
 
 			apiAddr := deriveAPIAddr(raftAddr)
@@ -443,6 +605,9 @@ func (b *Backend) fetchRaftStatuses() map[string]map[string]interface{} {
 					}
 					if cidx, ok := apiRes["commit_index"]; ok {
 						statusEntry["commit_index"] = cidx
+					}
+					if term, ok := apiRes["term"]; ok {
+						statusEntry["term"] = term
 					}
 				}
 			}
@@ -484,6 +649,12 @@ func (b *Backend) HandleRaftStatus(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, nodeID := range raftBackupNodes {
+		// A promoted standby now lives in config.RaftNodes and is already
+		// in `live` with its real Raft state; don't list it twice.
+		if _, inLive := live[nodeID]; inLive {
+			continue
+		}
+
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
@@ -561,6 +732,8 @@ func (b *Backend) HandlePromoteRaft(w http.ResponseWriter, r *http.Request) {
 		if err := PromoteToVoter(apiAddr, nodeID, addr); err == nil {
 			b.mu.Lock()
 			b.usedBackups[nodeID] = true
+			b.config.RaftNodes[nodeID] = addr
+			b.persistRaftTopologyLocked()
 			b.mu.Unlock()
 			b.logEvent(fmt.Sprintf("Promoted standby %s to full raft voter", nodeID))
 			w.WriteHeader(http.StatusOK)
@@ -572,6 +745,55 @@ func (b *Backend) HandlePromoteRaft(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, fmt.Sprintf("promote failed: %v", lastErr), http.StatusInternalServerError)
+}
+
+// HandleKillRaft simulates a network partition for one raft node, the raft
+// counterpart of /kill-node. The process keeps running, but the orchestrator
+// stops contacting it and reports it Dead, so the failover watcher promotes
+// a standby after RAFT_FAILOVER_STREAK checks. (To test a real crash, stop
+// the container instead, e.g. `docker-compose stop raft-03`.)
+func (b *Backend) HandleKillRaft(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.URL.Query().Get("id")
+	if nodeID == "" {
+		http.Error(w, "missing ?id=", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.Lock()
+	addr, ok := b.config.RaftNodes[nodeID]
+	if !ok {
+		b.mu.Unlock()
+		http.Error(w, fmt.Sprintf("unknown raft node %s", nodeID), http.StatusNotFound)
+		return
+	}
+	b.killedRaft[nodeID] = true
+	if b.raftLeaderAPI == deriveAPIAddr(addr) {
+		b.raftLeaderAPI = "" // don't keep routing writes to the "killed" leader
+	}
+	b.mu.Unlock()
+
+	atomic.AddInt64(&b.killEventsTotal, 1)
+	b.logEvent(fmt.Sprintf("Chaos: simulated partition of raft node %s", nodeID))
+	w.WriteHeader(http.StatusOK)
+}
+
+// HandleReviveRaft ends a simulated partition. If failover already replaced
+// the node, it is no longer in the raft config and this only clears the flag.
+func (b *Backend) HandleReviveRaft(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.URL.Query().Get("id")
+	if nodeID == "" {
+		http.Error(w, "missing ?id=", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.Lock()
+	delete(b.killedRaft, nodeID)
+	delete(b.raftDeadStreak, nodeID)
+	b.mu.Unlock()
+
+	atomic.AddInt64(&b.reviveEventsTotal, 1)
+	b.logEvent(fmt.Sprintf("Chaos: restored raft node %s", nodeID))
+	w.WriteHeader(http.StatusOK)
 }
 
 // startRaftFailoverWatcher polls raft node health every 5s. If a main raft
@@ -626,9 +848,19 @@ func (b *Backend) startRaftFailoverWatcher() {
 				}
 			}
 
+			// Contact healthy nodes only, so a dead one can't burn a full HTTP
+			// timeout per attempt. Fall back to everyone if none look healthy.
+			deadAddr := b.config.RaftNodes[deadNode]
 			raftNodes := make([]string, 0, len(b.config.RaftNodes))
-			for _, a := range b.config.RaftNodes {
-				raftNodes = append(raftNodes, a)
+			allNodes := make([]string, 0, len(b.config.RaftNodes))
+			for id, a := range b.config.RaftNodes {
+				allNodes = append(allNodes, a)
+				if b.raftDeadStreak[id] == 0 && !b.killedRaft[id] {
+					raftNodes = append(raftNodes, a)
+				}
+			}
+			if len(raftNodes) == 0 {
+				raftNodes = allNodes
 			}
 			b.mu.Unlock()
 
@@ -648,11 +880,42 @@ func (b *Backend) startRaftFailoverWatcher() {
 				}
 			}
 
+			// Promotion succeeded: now remove the dead voter from the Raft
+			// configuration so the voter count doesn't keep growing, and
+			// swap it for the standby in the orchestrator's own node list.
+			// (Promote first, remove second: the cluster never drops below
+			// the voters it had before the failure.)
+			removeErr := error(nil)
+			if promoted {
+				removeErr = fmt.Errorf("no reachable raft node to remove through")
+				for _, raftAddr := range raftNodes {
+					if raftAddr == deadAddr {
+						continue // don't wait on the node we know is dead
+					}
+					if err := RemoveFromCluster(deriveAPIAddr(raftAddr), deadNode); err == nil {
+						removeErr = nil
+						break
+					} else {
+						removeErr = err
+					}
+				}
+			}
+
 			b.mu.Lock()
 			if promoted {
 				b.raftPromoted[deadNode] = true
 				b.usedBackups[standbyID] = true
+				b.config.RaftNodes[standbyID] = standbyAddr
+				delete(b.config.RaftNodes, deadNode)
+				delete(b.raftDeadStreak, deadNode)
+				delete(b.killedRaft, deadNode)
+				b.raftLeaderAPI = "" // topology changed; re-discover the leader
+				b.persistRaftTopologyLocked()
 				b.mu.Unlock()
+				if removeErr != nil {
+					fmt.Printf("[RaftWatcher] promoted %s but could not remove dead %s from raft config: %v\n", standbyID, deadNode, removeErr)
+					b.logEvent(fmt.Sprintf("WARNING: %s promoted but dead node %s is still in the raft configuration (remove failed)", standbyID, deadNode))
+				}
 				msg := fmt.Sprintf("Auto-failover: %s unreachable for %ds, promoted standby %s in its place", deadNode, streakThreshold*5, standbyID)
 				fmt.Println("[RaftWatcher] " + msg)
 				b.logEvent(msg)
@@ -674,6 +937,7 @@ func (b *Backend) HandleKillNode(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	b.killedNodes[nodeID] = true
 	b.mu.Unlock()
+	atomic.AddInt64(&b.killEventsTotal, 1)
 
 	fmt.Printf("=> Simulating Network Partition for %s\n", nodeID)
 	b.rerouteShardsAwayFrom(nodeID)
@@ -707,6 +971,11 @@ func (b *Backend) rerouteShardsAwayFrom(nodeID string) {
 			chunkID := fmt.Sprintf("%s_%s", fileID, mapping.ShardID)
 
 			if newChunkMap[chunkID] == nodeID {
+				if meta.BackupMap[chunkID] == "" || meta.BackupMap[chunkID] == nodeID {
+					// No verified backup copy exists; leave the mapping alone
+					// instead of pointing it at a shard that isn't there.
+					continue
+				}
 				newChunkMap[chunkID] = meta.BackupMap[chunkID]
 				newMappings[i].NodeID = meta.BackupMap[chunkID]
 				needsUpdate = true
@@ -723,7 +992,9 @@ func (b *Backend) rerouteShardsAwayFrom(nodeID string) {
 	b.mu.RUnlock()
 
 	for fileID, meta := range filesToUpdate {
-		b.saveMeta(fileID, meta)
+		if err := b.saveMeta(fileID, meta); err != nil {
+			b.logEvent(fmt.Sprintf("WARNING: reroute of %s applied locally but Raft commit failed: %v", fileID, err))
+		}
 		fmt.Printf("=> RS Failover: Rerouted shards for file %s away from %s\n", fileID, nodeID)
 	}
 }
@@ -738,6 +1009,7 @@ func (b *Backend) HandleReviveNode(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	delete(b.killedNodes, nodeID)
 	b.mu.Unlock()
+	atomic.AddInt64(&b.reviveEventsTotal, 1)
 
 	fmt.Printf("=> Restoring Network Path to %s\n", nodeID)
 	b.restoreShardsHomeTo(nodeID)
@@ -749,6 +1021,7 @@ func (b *Backend) HandleReviveNode(w http.ResponseWriter, r *http.Request) {
 // rerouted to, once nodeID is confirmed reachable again. Shared by the
 // manual /revive-node endpoint and the automatic storage watcher below.
 func (b *Backend) restoreShardsHomeTo(nodeID string) {
+	healStart := time.Now()
 	ctx := context.Background()
 
 	b.mu.RLock()
@@ -800,9 +1073,13 @@ func (b *Backend) restoreShardsHomeTo(nodeID string) {
 	b.mu.RUnlock()
 
 	for fileID, meta := range filesToUpdate {
-		b.saveMeta(fileID, meta)
+		if err := b.saveMeta(fileID, meta); err != nil {
+			b.logEvent(fmt.Sprintf("WARNING: restore of %s applied locally but Raft commit failed: %v", fileID, err))
+		}
 		fmt.Printf("=> RS Restoration: Pulled shards back home to %s for file %s\n", nodeID, fileID)
 	}
+
+	healLatencyMs.Observe(float64(time.Since(healStart).Milliseconds()))
 }
 
 // startStorageFailoverWatcher is the storage-node equivalent of
@@ -871,6 +1148,12 @@ func (b *Backend) startStorageFailoverWatcher() {
 }
 
 func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	atomic.AddInt64(&b.uploadRequestsTotal, 1)
+	defer func() {
+		b.uploadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -963,6 +1246,7 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	checksumMap := make(map[string]string)
 
 	var mappings []ShardMapping
+	lostShards := 0 // shards that failed on BOTH home and backup
 
 	for i := 0; i < rsTotalShards; i++ {
 		chunkData := shards[i]
@@ -1011,17 +1295,29 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("[Upload] PutShard to backup %s ALSO failed for %s shard %d: %v - shard is not stored anywhere\n",
 					backupNode, fileID, i, backupErr)
 				b.logEvent(fmt.Sprintf("CRITICAL: shard %d of %s failed on both primary %s and backup %s - data not stored", i, fileID, homeNode, backupNode))
+				lostShards++
+				// Nothing was stored: don't record a location for this shard.
+				// (Empty node IDs are skipped by fetch, reroute and delete.)
+				targetNode = ""
+				backupNode = ""
 			}
 		} else if targetNode != backupNode {
-			// Primary succeeded, push a redundancy copy to the backup node
-			_ = b.cc.PutShard(
+			// Primary succeeded, push a redundancy copy to the backup node.
+			// If this fails, do NOT record the backup as holding the shard,
+			// otherwise a later reroute would point at a shard that doesn't exist.
+			if backupErr := b.cc.PutShard(
 				ctx,
 				backupNode,
 				fileID,
 				uint32(i),
 				chunkData,
 				checksum,
-			)
+			); backupErr != nil {
+				fmt.Printf("[Upload] redundancy copy to backup %s failed for %s shard %d: %v\n",
+					backupNode, fileID, i, backupErr)
+				b.logEvent(fmt.Sprintf("WARNING: shard %d of %s has no backup copy (backup %s write failed)", i, fileID, backupNode))
+				backupNode = ""
+			}
 		}
 
 		chunkMap[fullChunkKey] = targetNode
@@ -1035,6 +1331,28 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 				NodeID:  targetNode,
 			},
 		)
+	}
+
+	// Reed-Solomon can only rebuild up to rsParityShards missing shards.
+	// Beyond that the file is unrecoverable, so abort instead of
+	// reporting success for data that isn't stored.
+	if lostShards > rsParityShards {
+		for key, node := range chunkMap {
+			idx := shardIndexOf(strings.TrimPrefix(key, fileID+"_"))
+			if node != "" {
+				_ = b.cc.DeleteShard(ctx, node, fileID, idx)
+			}
+			if bn := backupMap[key]; bn != "" && bn != node {
+				_ = b.cc.DeleteShard(ctx, bn, fileID, idx)
+			}
+		}
+		b.commitUploadWAL(fileID)
+		b.logEvent(fmt.Sprintf("Upload of %s aborted: %d shards failed on both home and backup (max recoverable: %d)", fileID, lostShards, rsParityShards))
+		http.Error(w, fmt.Sprintf("Upload failed: %d shards could not be stored (max recoverable: %d)", lostShards, rsParityShards), http.StatusServiceUnavailable)
+		return
+	}
+	if lostShards > 0 {
+		b.logEvent(fmt.Sprintf("WARNING: %s stored with %d lost shard(s); no redundancy margin left for those", fileID, lostShards))
 	}
 
 	meta := FileMeta{
@@ -1053,12 +1371,26 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		UploadedAt:   time.Now().Unix(),
 	}
 
-	if err := b.saveMeta(fileID, meta); err != nil {
-		http.Error(w, "Consensus failed: "+err.Error(), http.StatusInternalServerError)
+	if err := b.saveMetaRaftFirst(fileID, meta); err != nil {
+		// Raft-first means nothing was recorded locally. Remove the shards
+		// this upload wrote and clear the WAL entry, then report failure.
+		for key, node := range chunkMap {
+			idx := shardIndexOf(strings.TrimPrefix(key, fileID+"_"))
+			if node != "" {
+				_ = b.cc.DeleteShard(ctx, node, fileID, idx)
+			}
+			if bn := backupMap[key]; bn != "" && bn != node {
+				_ = b.cc.DeleteShard(ctx, bn, fileID, idx)
+			}
+		}
+		b.commitUploadWAL(fileID)
+		b.logEvent(fmt.Sprintf("Upload of %s failed: Raft commit failed: %v", fileID, err))
+		http.Error(w, "Consensus failed: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
 	b.commitUploadWAL(fileID)
+	atomic.AddInt64(&b.uploadSuccessTotal, 1)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Upload successful"))
@@ -1097,7 +1429,7 @@ func (b *Backend) fetchShardAdaptive(
 	var wg sync.WaitGroup
 
 	for _, nodeID := range nodeIDs {
-		if nodeID == "" || b.killedNodes[nodeID] {
+		if nodeID == "" || b.isNodeKilled(nodeID) {
 			resCh <- result{}
 			continue
 		}
@@ -1107,18 +1439,30 @@ func (b *Backend) fetchShardAdaptive(
 		go func(nodeID string) {
 			defer wg.Done()
 
+			fetchStart := time.Now()
 			data, _, err := b.cc.GetShard(
 				raceCtx,
 				nodeID,
 				fileID,
 				shardIdx,
 			)
+			shardFetchLatencyMs.Observe(float64(time.Since(fetchStart).Milliseconds()))
 
-			if err != nil || len(data) == 0 || !verifyChecksum(data, checksum) {
+			// If the race was already decided by another goroutine, this
+			// fetch was cancelled out from under us - don't count it as a
+			// genuine failure, it just lost the race.
+			if raceCtx.Err() != nil {
 				resCh <- result{}
 				return
 			}
 
+			if err != nil || len(data) == 0 || !verifyChecksum(data, checksum) {
+				atomic.AddInt64(&b.shardFetchFailTotal, 1)
+				resCh <- result{}
+				return
+			}
+
+			atomic.AddInt64(&b.shardFetchSuccessTotal, 1)
 			resCh <- result{
 				data: data,
 				ok:   true,
@@ -1148,6 +1492,9 @@ func (b *Backend) downloadFileAdaptive(
 	if countStats {
 		atomic.AddInt64(&b.sfTotal, 1)
 	}
+
+	atomic.AddInt64(&b.sfInflight, 1)
+	defer atomic.AddInt64(&b.sfInflight, -1)
 
 	fileOut, name, err, shared := b.sfGroup.Do(fileID, func() ([]byte, string, error) {
 		b.mu.RLock()
@@ -1215,6 +1562,7 @@ func (b *Backend) downloadFileAdaptive(
 		}
 
 		fileOut, err := reconstructAndJoin(shards, int(meta.Size))
+		atomic.AddInt64(&b.reconstructTotal, 1)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1242,6 +1590,11 @@ func (b *Backend) HandleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Backend) HandleDownload(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		b.downloadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	fileID := r.URL.Query().Get("id")
 
 	if fileID == "" {
@@ -1260,6 +1613,7 @@ func (b *Backend) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		)
 
 		w.Write(fileOut)
+		atomic.AddInt64(&b.downloadSuccessTotal, 1)
 		b.touchLastAccessed(fileID)
 		return
 	}
@@ -1321,7 +1675,9 @@ func (b *Backend) touchLastAccessed(fileID string) {
 	}
 
 	meta.LastAccessed = time.Now().Unix()
-	_ = b.saveMeta(fileID, meta)
+	if err := b.saveMeta(fileID, meta); err != nil {
+		fmt.Printf("[Raft] last-accessed update for %s not committed: %v\n", fileID, err)
+	}
 }
 
 func contentTypeFor(name, disposition string) string {
@@ -1363,19 +1719,21 @@ func (b *Backend) deleteFilePermanently(fileID string) {
 			chunkID := fmt.Sprintf("%s_%s", fileID, mapping.ShardID)
 			shardIdx := shardIndexOf(mapping.ShardID)
 
-			_ = b.cc.DeleteShard(
-				ctx,
+			// Delete from every node that may hold a copy: current location,
+			// backup, and the original home (a rerouted shard leaves a stale
+			// copy there). Skip empty IDs and duplicates.
+			seen := map[string]bool{"": true}
+			for _, node := range []string{
 				meta.ChunkMap[chunkID],
-				fileID,
-				shardIdx,
-			)
-
-			_ = b.cc.DeleteShard(
-				ctx,
 				meta.BackupMap[chunkID],
-				fileID,
-				shardIdx,
-			)
+				meta.HomeMap[chunkID],
+			} {
+				if seen[node] {
+					continue
+				}
+				seen[node] = true
+				_ = b.cc.DeleteShard(ctx, node, fileID, shardIdx)
+			}
 		}
 
 		_ = b.db.Delete(
@@ -1426,6 +1784,7 @@ func (b *Backend) startUnifiedSweeper() {
 
 			for _, fileID := range timeExpiredFiles {
 				b.deleteFilePermanently(fileID)
+				atomic.AddInt64(&b.sweeperEvictionsTotal, 1)
 
 				fmt.Printf(
 					"[Sweeper] Evicted abandoned 30-day file over network: %s\n",
@@ -1451,7 +1810,10 @@ func (b *Backend) HandleTogglePin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	meta.IsPinned = !meta.IsPinned
-	_ = b.saveMeta(fileID, meta)
+	if err := b.saveMetaRaftFirst(fileID, meta); err != nil {
+		http.Error(w, "Consensus failed: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 }

@@ -26,6 +26,13 @@ message StatsResponse {
     int64 mem_hits = 1;
     int64 disk_hits = 2;
     int64 misses = 3;
+    int64 storage_bytes = 4;
+    repeated int64 hit_latency_counts = 5;
+    double hit_latency_sum = 6;
+    int64 hit_latency_count = 7;
+    repeated int64 miss_latency_counts = 8;
+    double miss_latency_sum = 9;
+    int64 miss_latency_count = 10;
 }
 
 // --- CORE CACHE MESSAGES ---

@@ -87,6 +87,7 @@ func startOrchestrator(configPath string) {
 	http.HandleFunc("/kill-node", backend.HandleKillNode)
 	http.HandleFunc("/revive-node", backend.HandleReviveNode)
 	http.HandleFunc("/events", backend.HandleEvents)
+	http.HandleFunc("/metrics", backend.HandleMetrics)
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

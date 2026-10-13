@@ -216,3 +216,12 @@ services:
       - "60057:60051"
     volumes:
       - ./data/raft-07:/app/raft
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9000:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - orchestrator

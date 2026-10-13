@@ -5,10 +5,19 @@ import (
 	"sync"
 )
 
+const (
+	qA1in = iota
+	qAm
+	qA1out
+)
+
 // CacheEntry holds the payload for active queues.
+// queue records which list the entry currently lives in, so we never
+// have to scan a list to find out.
 type CacheEntry struct {
-	Key  string
-	Data []byte
+	Key   string
+	Data  []byte
+	queue int
 }
 
 // InspectResult packages the queue states for the orchestrator's dashboard.
@@ -22,10 +31,9 @@ type InspectResult struct {
 type TwoQEngine struct {
 	mu sync.RWMutex
 
-	capacity int
-	a1inCap  int
-	a1outCap int
-	amCap    int
+	capacity int // max real entries: a1in + am
+	a1inCap  int // target size of A1in (only enforced when the cache is full)
+	a1outCap int // max ghost keys
 
 	a1in  *list.List
 	a1out *list.List
@@ -34,14 +42,14 @@ type TwoQEngine struct {
 	items map[string]*list.Element
 }
 
-// NewTwoQEngine initializes the cache engine with proportional queue limits.
 func NewTwoQEngine(totalCapacity int) *TwoQEngine {
-	// Standard 2Q ratio: 25% A1in, 50% A1out, 25% Am
+	if totalCapacity < 4 {
+		totalCapacity = 4
+	}
 	return &TwoQEngine{
 		capacity: totalCapacity,
 		a1inCap:  totalCapacity / 4,
 		a1outCap: totalCapacity / 2,
-		amCap:    totalCapacity / 4,
 		a1in:     list.New(),
 		a1out:    list.New(),
 		am:       list.New(),
@@ -49,7 +57,7 @@ func NewTwoQEngine(totalCapacity int) *TwoQEngine {
 	}
 }
 
-// Get retrieves data and handles queue promotion if a ghost key is accessed.
+// Get returns data only for real (in-memory) entries. Ghosts are misses.
 func (c *TwoQEngine) Get(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,50 +66,67 @@ func (c *TwoQEngine) Get(key string) ([]byte, bool) {
 	if !found {
 		return nil, false
 	}
+	entry := el.Value.(*CacheEntry)
 
-	// If it's in the A1out ghost cache, it's genuinely hot. Promote to Am (LRU).
-	if el.Value.(*CacheEntry).Data == nil {
-		return nil, false // Data isn't actually in memory, it's just a ghost record
-	}
-
-	// If it's already in Am, mark it as recently used by moving it to the front
-	// Note: We leave A1in items alone until they are pushed out to A1out
-	if c.isAm(el) {
+	switch entry.queue {
+	case qAm:
 		c.am.MoveToFront(el)
+		return entry.Data, true
+	case qA1in:
+		// FIFO: a hit in A1in does not change its position.
+		return entry.Data, true
+	default: // ghost
+		return nil, false
 	}
-
-	return el.Value.(*CacheEntry).Data, true
 }
 
-// Put inserts new data, managing capacity and cascading evictions across the queues.
+// Put inserts or updates a key.
 func (c *TwoQEngine) Put(key string, data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if el, found := c.items[key]; found {
 		entry := el.Value.(*CacheEntry)
-		
-		// If it's a ghost record (A1out), promote it to the hot LRU queue (Am)
-		if entry.Data == nil {
+		switch entry.queue {
+		case qA1out:
+			// Seen again after leaving A1in: genuinely hot, promote to Am.
 			c.a1out.Remove(el)
 			entry.Data = data
+			entry.queue = qAm
 			c.items[key] = c.am.PushFront(entry)
-			c.enforceAmCapacity()
-			return
-		}
-
-		// Update existing hot data
-		entry.Data = data
-		if c.isAm(el) {
+			c.reclaim()
+		case qAm:
+			entry.Data = data
 			c.am.MoveToFront(el)
+		default: // qA1in
+			entry.Data = data
 		}
 		return
 	}
 
-	// Brand new item: push to A1in (FIFO)
-	entry := &CacheEntry{Key: key, Data: data}
+	entry := &CacheEntry{Key: key, Data: data, queue: qA1in}
 	c.items[key] = c.a1in.PushFront(entry)
-	c.enforceA1inCapacity()
+	c.reclaim()
+}
+
+// Delete removes a key entirely (real entry or ghost).
+func (c *TwoQEngine) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	el, found := c.items[key]
+	if !found {
+		return
+	}
+	switch el.Value.(*CacheEntry).queue {
+	case qA1in:
+		c.a1in.Remove(el)
+	case qAm:
+		c.am.Remove(el)
+	default:
+		c.a1out.Remove(el)
+	}
+	delete(c.items, key)
 }
 
 // Inspect returns a snapshot of the current queue states for the UI.
@@ -116,47 +141,36 @@ func (c *TwoQEngine) Inspect() InspectResult {
 	}
 }
 
-// -- Internal Capacity Management & Helpers --
-
-func (c *TwoQEngine) enforceA1inCapacity() {
-	for c.a1in.Len() > c.a1inCap {
-		evicted := c.a1in.Back()
-		c.a1in.Remove(evicted)
-		
-		// Strip the data to save RAM, but keep the key in the ghost cache (A1out)
-		entry := evicted.Value.(*CacheEntry)
-		entry.Data = nil 
-		c.items[entry.Key] = c.a1out.PushFront(entry)
-	}
-	
-	// Ensure the ghost cache doesn't grow infinitely
-	for c.a1out.Len() > c.a1outCap {
-		evicted := c.a1out.Back()
-		c.a1out.Remove(evicted)
-		delete(c.items, evicted.Value.(*CacheEntry).Key)
-	}
-}
-
-func (c *TwoQEngine) enforceAmCapacity() {
-	for c.am.Len() > c.amCap {
-		evicted := c.am.Back()
-		c.am.Remove(evicted)
-		delete(c.items, evicted.Value.(*CacheEntry).Key)
-	}
-}
-
-func (c *TwoQEngine) isAm(el *list.Element) bool {
-	// A quick check to see if an element belongs to the Am queue
-	for e := c.am.Front(); e != nil; e = e.Next() {
-		if e == el {
-			return true
+// reclaim frees space ONLY when real entries exceed total capacity.
+// Until then, A1in is allowed to use any free space, so the cache never
+// ghosts entries while RAM sits empty.
+func (c *TwoQEngine) reclaim() {
+	for c.a1in.Len()+c.am.Len() > c.capacity {
+		if c.a1in.Len() > c.a1inCap || c.am.Len() == 0 {
+			// A1in is over its share: demote its oldest entry to a ghost.
+			el := c.a1in.Back()
+			c.a1in.Remove(el)
+			entry := el.Value.(*CacheEntry)
+			entry.Data = nil
+			entry.queue = qA1out
+			c.items[entry.Key] = c.a1out.PushFront(entry)
+		} else {
+			// Otherwise evict the least recently used hot entry outright.
+			el := c.am.Back()
+			c.am.Remove(el)
+			delete(c.items, el.Value.(*CacheEntry).Key)
 		}
 	}
-	return false
+
+	for c.a1out.Len() > c.a1outCap {
+		el := c.a1out.Back()
+		c.a1out.Remove(el)
+		delete(c.items, el.Value.(*CacheEntry).Key)
+	}
 }
 
 func (c *TwoQEngine) extractKeys(l *list.List) []string {
-	var keys []string
+	keys := make([]string, 0, l.Len())
 	for e := l.Front(); e != nil; e = e.Next() {
 		keys = append(keys, e.Value.(*CacheEntry).Key)
 	}

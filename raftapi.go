@@ -49,6 +49,9 @@ type joinRequest struct {
 //     A standby node asks to be added as a nonvoter. Only the leader can do
 //     this; a follower redirects like /apply does.
 //
+// POST /remove
+//     Removes a server from the Raft configuration. Leader only.
+//
 // POST /promote
 //     Promotes an existing nonvoter to a full voter. Only the leader can do
 //     this; a follower redirects like /apply does.
@@ -143,6 +146,13 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			}
 		}
 
+		term := uint64(0)
+		if value, ok := stats["term"]; ok {
+			if parsed, err := strconv.ParseUint(value, 10, 64); err == nil {
+				term = parsed
+			}
+		}
+
 		state := r.State().String()
 		leaderAddr := string(r.Leader())
 
@@ -154,6 +164,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			"leader_addr":  leaderAddr,
 			"is_leader":    r.State() == raft.Leader,
 			"commit_index": commitIndex,
+			"term":         term,
 		})
 	})
 
@@ -229,6 +240,41 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// /remove: removes a (dead) server from the Raft configuration entirely,
+	// so it stops counting toward the voter set / quorum. Leader only.
+	mux.HandleFunc("/remove", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if redirectIfNotLeader(w) {
+			return
+		}
+
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		defer req.Body.Close()
+
+		var jr joinRequest
+		if err := json.Unmarshal(body, &jr); err != nil || jr.ID == "" {
+			http.Error(w, "invalid remove request, need {id}", http.StatusBadRequest)
+			return
+		}
+
+		future := r.RemoveServer(raft.ServerID(jr.ID), 0, 5*time.Second)
+		if err := future.Error(); err != nil {
+			http.Error(w, "remove server failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Printf("[%s] removed %s from the raft configuration\n", nodeID, jr.ID)
+		w.WriteHeader(http.StatusOK)
+	})
+
 	go func() {
 		if err := http.ListenAndServe(apiBindAddr, mux); err != nil {
 			panic(fmt.Sprintf("[%s] Raft API server crashed: %v", nodeID, err))
@@ -269,6 +315,17 @@ func PromoteToVoter(apiAddr, nodeID, address string) error {
 	}
 
 	return postWithLeaderRedirect(apiAddr, "/promote", body)
+}
+
+// RemoveFromCluster asks the raft node at apiAddr (any known member) to
+// remove nodeID from the Raft configuration.
+func RemoveFromCluster(apiAddr, nodeID string) error {
+	body, err := json.Marshal(joinRequest{ID: nodeID})
+	if err != nil {
+		return fmt.Errorf("marshal remove request: %w", err)
+	}
+
+	return postWithLeaderRedirect(apiAddr, "/remove", body)
 }
 
 // postWithLeaderRedirect POSTs body to http://addr+path, following a single

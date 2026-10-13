@@ -59,12 +59,19 @@ func (*StatsRequest) Descriptor() ([]byte, []int) {
 }
 
 type StatsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MemHits       int64                  `protobuf:"varint,1,opt,name=mem_hits,json=memHits,proto3" json:"mem_hits,omitempty"`
-	DiskHits      int64                  `protobuf:"varint,2,opt,name=disk_hits,json=diskHits,proto3" json:"disk_hits,omitempty"`
-	Misses        int64                  `protobuf:"varint,3,opt,name=misses,proto3" json:"misses,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	MemHits           int64                  `protobuf:"varint,1,opt,name=mem_hits,json=memHits,proto3" json:"mem_hits,omitempty"`
+	DiskHits          int64                  `protobuf:"varint,2,opt,name=disk_hits,json=diskHits,proto3" json:"disk_hits,omitempty"`
+	Misses            int64                  `protobuf:"varint,3,opt,name=misses,proto3" json:"misses,omitempty"`
+	StorageBytes      int64                  `protobuf:"varint,4,opt,name=storage_bytes,json=storageBytes,proto3" json:"storage_bytes,omitempty"`
+	HitLatencyCounts  []int64                `protobuf:"varint,5,rep,packed,name=hit_latency_counts,json=hitLatencyCounts,proto3" json:"hit_latency_counts,omitempty"`
+	HitLatencySum     float64                `protobuf:"fixed64,6,opt,name=hit_latency_sum,json=hitLatencySum,proto3" json:"hit_latency_sum,omitempty"`
+	HitLatencyCount   int64                  `protobuf:"varint,7,opt,name=hit_latency_count,json=hitLatencyCount,proto3" json:"hit_latency_count,omitempty"`
+	MissLatencyCounts []int64                `protobuf:"varint,8,rep,packed,name=miss_latency_counts,json=missLatencyCounts,proto3" json:"miss_latency_counts,omitempty"`
+	MissLatencySum    float64                `protobuf:"fixed64,9,opt,name=miss_latency_sum,json=missLatencySum,proto3" json:"miss_latency_sum,omitempty"`
+	MissLatencyCount  int64                  `protobuf:"varint,10,opt,name=miss_latency_count,json=missLatencyCount,proto3" json:"miss_latency_count,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *StatsResponse) Reset() {
@@ -114,6 +121,55 @@ func (x *StatsResponse) GetDiskHits() int64 {
 func (x *StatsResponse) GetMisses() int64 {
 	if x != nil {
 		return x.Misses
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetStorageBytes() int64 {
+	if x != nil {
+		return x.StorageBytes
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetHitLatencyCounts() []int64 {
+	if x != nil {
+		return x.HitLatencyCounts
+	}
+	return nil
+}
+
+func (x *StatsResponse) GetHitLatencySum() float64 {
+	if x != nil {
+		return x.HitLatencySum
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetHitLatencyCount() int64 {
+	if x != nil {
+		return x.HitLatencyCount
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMissLatencyCounts() []int64 {
+	if x != nil {
+		return x.MissLatencyCounts
+	}
+	return nil
+}
+
+func (x *StatsResponse) GetMissLatencySum() float64 {
+	if x != nil {
+		return x.MissLatencySum
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMissLatencyCount() int64 {
+	if x != nil {
+		return x.MissLatencyCount
 	}
 	return 0
 }
@@ -924,11 +980,19 @@ const file_cdcs_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
 	"cdcs.proto\x12\x04cdcs\"\x0e\n" +
-	"\fStatsRequest\"_\n" +
+	"\fStatsRequest\"\x8e\x03\n" +
 	"\rStatsResponse\x12\x19\n" +
 	"\bmem_hits\x18\x01 \x01(\x03R\amemHits\x12\x1b\n" +
 	"\tdisk_hits\x18\x02 \x01(\x03R\bdiskHits\x12\x16\n" +
-	"\x06misses\x18\x03 \x01(\x03R\x06misses\"\x1e\n" +
+	"\x06misses\x18\x03 \x01(\x03R\x06misses\x12#\n" +
+	"\rstorage_bytes\x18\x04 \x01(\x03R\fstorageBytes\x12,\n" +
+	"\x12hit_latency_counts\x18\x05 \x03(\x03R\x10hitLatencyCounts\x12&\n" +
+	"\x0fhit_latency_sum\x18\x06 \x01(\x01R\rhitLatencySum\x12*\n" +
+	"\x11hit_latency_count\x18\a \x01(\x03R\x0fhitLatencyCount\x12.\n" +
+	"\x13miss_latency_counts\x18\b \x03(\x03R\x11missLatencyCounts\x12(\n" +
+	"\x10miss_latency_sum\x18\t \x01(\x01R\x0emissLatencySum\x12,\n" +
+	"\x12miss_latency_count\x18\n" +
+	" \x01(\x03R\x10missLatencyCount\"\x1e\n" +
 	"\n" +
 	"GetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\";\n" +
