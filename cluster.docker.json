@@ -1,0 +1,33 @@
+{
+  "storage_nodes": {
+    "Node-01": "node-01:50051",
+    "Node-02": "node-02:50051",
+    "Node-03": "node-03:50051",
+    "Node-04": "node-04:50051",
+    "Node-05": "node-05:50051",
+    "Node-06": "node-06:50051"
+  },
+  "backup_node_addrs": {
+    "Node-07": "backup-01:50051",
+    "Node-08": "backup-02:50051"
+  },
+  "raft_nodes": {
+    "Raft-01": "raft-01:60051",
+    "Raft-02": "raft-02:60051",
+    "Raft-03": "raft-03:60051",
+    "Raft-04": "raft-04:60051",
+    "Raft-05": "raft-05:60051"
+  },
+  "raft_backup_addrs": {
+    "Raft-06": "raft-06:60051",
+    "Raft-07": "raft-07:60051"
+  },
+  "backup_nodes": [
+    "Node-07",
+    "Node-08"
+  ],
+  "raft_backup_nodes": [
+    "Raft-06",
+    "Raft-07"
+  ]
+}

@@ -1,0 +1,9 @@
+51",
+    "Node-06": "node-06:50051"
+  },
+  "backup_node_addrs": {
+    "Node-07": "backup-01:50051",
+    "Node-08": "backup-02:50051"
+  },
+  "raft_nodes": {
+    "Raft-01": "raft

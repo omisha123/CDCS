@@ -1,4 +1,6 @@
 node_storage/
 metadata.db/
+data/
+.env
 .git/
 *.exe

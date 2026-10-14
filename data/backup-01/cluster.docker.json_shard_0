@@ -1,0 +1,7 @@
+{
+  "storage_nodes": {
+    "Node-01": "node-01:50051",
+    "Node-02": "node-02:50051",
+    "Node-03": "node-03:50051",
+    "Node-04": "node-04:50051",
+    "Node-05": "node-05:500

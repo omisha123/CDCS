@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 
 // LogCommand is defined in reedsolomon.go.
 // MetadataFSM.Apply in raft.go unmarshals every committed Raft log entry.
+// maxRaftBodySize caps every request body the Raft API reads. A LogCommand
+// with a file's metadata is a few KB, so 1 MB is far more than enough.
+const maxRaftBodySize = 1 << 20
+
 func deriveAPIAddr(raftAddr string) string {
 	host, portStr, err := net.SplitHostPort(raftAddr)
 	if err != nil {
@@ -78,7 +83,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 		return true
 	}
 
-	mux.HandleFunc("/apply", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/apply", adminOnly(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -88,7 +93,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			return
 		}
 
-		body, err := io.ReadAll(req.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRaftBodySize))
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
@@ -114,7 +119,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 		}
 
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
 	mux.HandleFunc("/meta", func(w http.ResponseWriter, req *http.Request) {
 		fileID := req.URL.Query().Get("id")
@@ -172,7 +177,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 	// added as a nonvoter. Nonvoters replicate the log in real time but never
 	// vote and never count toward quorum - so adding one can't destabilize
 	// the existing cluster.
-	mux.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/join", adminOnly(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -182,7 +187,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			return
 		}
 
-		body, err := io.ReadAll(req.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRaftBodySize))
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
@@ -203,11 +208,11 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 
 		fmt.Printf("[%s] standby %s (%s) joined as nonvoter\n", nodeID, jr.ID, jr.Address)
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
 	// /promote: upgrades an existing nonvoter to a full voting member. Called
 	// by the orchestrator when a main raft node is confirmed dead.
-	mux.HandleFunc("/promote", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/promote", adminOnly(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -217,7 +222,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			return
 		}
 
-		body, err := io.ReadAll(req.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRaftBodySize))
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
@@ -238,11 +243,11 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 
 		fmt.Printf("[%s] promoted standby %s (%s) to full voter\n", nodeID, jr.ID, jr.Address)
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
 	// /remove: removes a (dead) server from the Raft configuration entirely,
 	// so it stops counting toward the voter set / quorum. Leader only.
-	mux.HandleFunc("/remove", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/remove", adminOnly(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -252,7 +257,7 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 			return
 		}
 
-		body, err := io.ReadAll(req.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxRaftBodySize))
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
@@ -273,10 +278,20 @@ func StartRaftAPI(nodeID, apiBindAddr string, r *raft.Raft, fsm *MetadataFSM, le
 
 		fmt.Printf("[%s] removed %s from the raft configuration\n", nodeID, jr.ID)
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
 	go func() {
-		if err := http.ListenAndServe(apiBindAddr, mux); err != nil {
+		// Explicit timeouts so a slow or stalled client can't hold
+		// connections open forever (bare ListenAndServe has none).
+		srv := &http.Server{
+			Addr:              apiBindAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil {
 			panic(fmt.Sprintf("[%s] Raft API server crashed: %v", nodeID, err))
 		}
 	}()
@@ -330,12 +345,32 @@ func RemoveFromCluster(apiAddr, nodeID string) error {
 
 // postWithLeaderRedirect POSTs body to http://addr+path, following a single
 // "not leader" redirect if the target isn't currently the Raft leader.
+//
+// If CDCS_ADMIN_TOKEN is set it is sent as X-Admin-Token (the Raft API's
+// write endpoints check it). The redirect target is taken only from the
+// X-Raft-Leader header and must use the same port as the original address
+// (every Raft API port is derived the same way), so a bogus response can't
+// bounce the request - and the token - to an arbitrary service.
 func postWithLeaderRedirect(addr, path string, body []byte) error {
 	url := "http://" + addr + path
-	client := &http.Client{Timeout: 6 * time.Second}
+	client := &http.Client{
+		Timeout:       6 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	token := os.Getenv("CDCS_ADMIN_TOKEN")
+	_, firstPort, _ := net.SplitHostPort(addr)
 
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("build request for raft API %s: %w", url, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("X-Admin-Token", token)
+		}
+
+		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("post to raft API %s: %w", url, err)
 		}
@@ -346,21 +381,17 @@ func postWithLeaderRedirect(addr, path string, body []byte) error {
 			return nil
 
 		case http.StatusMisdirectedRequest:
-			location := resp.Header.Get("Location")
-			if location == "" {
-				if leader := resp.Header.Get("X-Raft-Leader"); leader != "" {
-					location = "http://" + leader + path
-				}
-			}
+			leader := resp.Header.Get("X-Raft-Leader")
 			resp.Body.Close()
 
-			if location == "" || attempt == 1 {
+			host, port, splitErr := net.SplitHostPort(leader)
+			if attempt == 1 || splitErr != nil || host == "" || port != firstPort {
 				return fmt.Errorf("not leader and no usable redirect from %s", url)
 			}
-			url = location
+			url = "http://" + leader + path
 
 		default:
-			msg, _ := io.ReadAll(resp.Body)
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			return fmt.Errorf("raft API %s returned %d: %s", url, resp.StatusCode, string(msg))
 		}

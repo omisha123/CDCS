@@ -375,6 +375,14 @@
     </div>
 
     <script>
+        // Everything that comes from the server (file names, IDs, node names,
+        // event text) must go through this before it is put into innerHTML.
+        function escapeHtml(v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
         // --- Theme Engine ---
         const themeSelect = document.getElementById('themeSelect');
 
@@ -452,7 +460,7 @@
                 nodes.sort((a, b) => a.id.localeCompare(b.id)).forEach(n => {
                     const div = document.createElement('div');
                     div.className = `node-card ${n.status}`;
-                    div.innerHTML = `<div style="font-size: 1.1em">${n.id}</div><div style="font-size: 0.85em; font-weight: normal; margin-top: 4px; font-family: 'Georgia', serif; font-style: italic;">${n.status}</div>`;
+                    div.innerHTML = `<div style="font-size: 1.1em">${escapeHtml(n.id)}</div><div style="font-size: 0.85em; font-weight: normal; margin-top: 4px; font-family: 'Georgia', serif; font-style: italic;">${escapeHtml(n.status)}</div>`;
                     if (n.is_backup) div.innerHTML += `<div class="backup-badge-sm">BACKUP</div>`;
                     container.appendChild(div);
                 });
@@ -500,7 +508,7 @@
                 
                 if (mappingsList.length > 0) {
                     mappingsList.forEach(m => {
-                        shardBadgesHtml += `<div class="shard-badge"><strong>${m.shard_id}</strong>➔ ${m.node_id}</div>`;
+                        shardBadgesHtml += `<div class="shard-badge"><strong>${escapeHtml(m.shard_id)}</strong>➔ ${escapeHtml(m.node_id)}</div>`;
                     });
                 } else {
                     shardBadgesHtml += '<div>No Shards Mapping Available</div>';
@@ -516,18 +524,31 @@
               
               tr.innerHTML = `
                   <td>${serialNo}</td>
-                  <td><strong>${f.id}</strong></td>
-                  <td style="word-break: break-all;">${f.is_pinned ? '⭐ ' : ''}${f.name}</td>
+                  <td><strong>${escapeHtml(f.id)}</strong></td>
+                  <td style="word-break: break-all;">${f.is_pinned ? '⭐ ' : ''}${escapeHtml(f.name)}</td>
                   <td style="color: var(--text-muted); font-size: 0.9em;">${uploadDate}</td>
                   <td><span class="badge">${formatBytes(f.size)}</span></td>
                   <td>${shardBadgesHtml}</td>
                   <td>
-                      <button onclick="togglePin('${f.id}')" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0;" title="${pinTitle}">${pinIcon}</button>
-                      <button onclick="window.open('/view?id=${encodeURIComponent(f.id)}', '_blank')" style="margin-left: 10px; margin-right: 5px;" title="View file">👁</button>
-                      <button onclick="window.location.href='/download?id=${encodeURIComponent(f.id)}'" style="margin-right: 5px;" title="Download file">↓</button> 
-                      <button class="btn-danger" onclick="deleteFile('${f.id}')">✗</button>
+                      <button data-act="pin" data-id="${escapeHtml(f.id)}" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0;" title="${pinTitle}">${pinIcon}</button>
+                      <button data-act="view" data-id="${escapeHtml(f.id)}" style="margin-left: 10px; margin-right: 5px;" title="View file">👁</button>
+                      <button data-act="download" data-id="${escapeHtml(f.id)}" style="margin-right: 5px;" title="Download file">↓</button> 
+                      <button class="btn-danger" data-act="delete" data-id="${escapeHtml(f.id)}">✗</button>
                   </td>
               `;
+              // Handlers are attached here instead of inline onclick="...('${id}')":
+              // an ID inside an inline JS string can break out of it.
+              tr.querySelectorAll('button[data-act]').forEach(btn => {
+                  const fid = btn.dataset.id;
+                  btn.addEventListener('click', () => {
+                      switch (btn.dataset.act) {
+                          case 'pin': togglePin(fid); break;
+                          case 'view': window.open('/view?id=' + encodeURIComponent(fid), '_blank', 'noopener'); break;
+                          case 'download': window.location.href = '/download?id=' + encodeURIComponent(fid); break;
+                          case 'delete': deleteFile(fid); break;
+                      }
+                  });
+              });
               tbody.appendChild(tr);
             });
         }
@@ -545,7 +566,7 @@
             if (logList.innerHTML.includes("Waiting for events")) logList.innerHTML = ''; 
             
             const li = document.createElement('li');
-            li.innerHTML = `<span>${message}</span> <span class="timestamp">${new Date().toLocaleTimeString()}</span>`;
+            li.innerHTML = `<span>${escapeHtml(message)}</span> <span class="timestamp">${new Date().toLocaleTimeString()}</span>`;
             logList.insertBefore(li, logList.firstChild);
             
             if (logList.children.length > 8) logList.removeChild(logList.lastChild);
@@ -613,7 +634,7 @@
                     ul.innerHTML = '<li style="color: var(--text-muted); padding: 4px 0;">Empty</li>';
                     return;
                 }
-                ul.innerHTML = items.map(i => `<li style="padding: 4px 0; border-bottom: 1px solid var(--border);">${i}</li>`).join('');
+                ul.innerHTML = items.map(i => `<li style="padding: 4px 0; border-bottom: 1px solid var(--border);">${escapeHtml(i)}</li>`).join('');
             };
 
             renderList('a1inList', data.a1in);
@@ -644,11 +665,22 @@
 
                     if (roleText === "Leader") {
                         roleBadge = "bg-leader";
-                    } else if (node.state === "Backup") {
+                    } else if (node.state === "Standby") {
+                        // Standby raft node that is reachable (backend sends "Standby").
                         roleText = "Standby";
                         roleBadge = "bg-standby";
                         statusText = "Standby";
                         statusBadge = "bg-standby";
+                    } else if (node.state === "Standby (not running)" || node.state === "Promoted (unreachable)") {
+                        roleText = node.state.startsWith("Promoted") ? "Promoted" : "Standby";
+                        roleBadge = "bg-standby";
+                        statusText = "Offline";
+                        statusBadge = "bg-offline";
+                    } else if (node.state === "Promoted") {
+                        roleText = "Promoted";
+                        roleBadge = "bg-standby";
+                        statusText = "Online";
+                        statusBadge = "bg-online";
                     } else if (node.state === "Dead") {
                         roleText = "Offline";
                         roleBadge = "bg-offline";
@@ -658,11 +690,11 @@
 
                     htmlBuffer += `
                         <tr>
-                            <td><strong>${node.id}</strong></td>
-                            <td><span class="badge ${roleBadge}">${roleText}</span></td>
-                            <td style="font-family: monospace; color: var(--text-muted);">${ipAddr}</td>
+                            <td><strong>${escapeHtml(node.id)}</strong></td>
+                            <td><span class="badge ${roleBadge}">${escapeHtml(roleText)}</span></td>
+                            <td style="font-family: monospace; color: var(--text-muted);">${escapeHtml(ipAddr)}</td>
                             <td><span class="badge ${statusBadge}">${statusText}</span></td>
-                            <td style="font-family: monospace; font-weight: bold;">${node.commit_index}</td>
+                            <td style="font-family: monospace; font-weight: bold;">${escapeHtml(node.commit_index)}</td>
                         </tr>
                     `;
                 });
@@ -743,7 +775,7 @@ async function fetchEvents() {
         const logList = document.getElementById('log-list');
         if (events.length === 0) return;
         logList.innerHTML = events.slice().reverse().slice(0, 30).map(e =>
-            `<li><span>${e.message}</span> <span class="timestamp">${new Date(e.time * 1000).toLocaleTimeString()}</span></li>`
+            `<li><span>${escapeHtml(e.message)}</span> <span class="timestamp">${new Date(e.time * 1000).toLocaleTimeString()}</span></li>`
         ).join('');
     } catch (err) { console.error('Failed to load events'); }
 }

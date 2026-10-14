@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -89,6 +91,10 @@ type Backend struct {
 	eventsMu  sync.Mutex
 	// Used for chaos testing to simulate network partitions without shutting down physical PCs
 	killedNodes map[string]bool
+	// Upload IDs reserved by an upload that is still running, so two
+	// concurrent uploads of the same ID cannot both pass the "already in use"
+	// check. Guarded by mu.
+	uploadsInFlight map[string]bool
 	// Simulated raft partitions (chaos testing): the orchestrator treats these
 	// raft nodes as unreachable even though the processes keep running.
 	killedRaft map[string]bool
@@ -123,6 +129,25 @@ type LogEvent struct {
 }
 
 var fileIDSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+// maxUploadSize is the hard cap on one uploaded file. The whole file is held
+// in RAM (plus its Reed-Solomon shards, ~1.5x more) while it is encoded, so
+// this is what bounds orchestrator memory per upload. Raise it only if the
+// orchestrator machine has the RAM for it.
+const maxUploadSize = 100 << 20
+
+// sameOrigin rejects cross-site requests to state-changing endpoints: a
+// browser always sends Origin on cross-site POST/DELETE, and it must match
+// the host the request was sent to. Requests without Origin (curl, scripts)
+// are allowed.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && u.Host == r.Host
+}
 
 // envIntOrDefault reads a positive integer from the named environment
 // variable, falling back to def if the variable is unset, empty, or not a
@@ -204,7 +229,14 @@ func NewBackend(configPath string) *Backend {
 		}
 	}
 
-	db, err := pebble.Open("metadata.db", &pebble.Options{})
+	// METADATA_DB_PATH lets Docker put the database on a mounted volume so
+	// file metadata survives container restarts.
+	dbPath := os.Getenv("METADATA_DB_PATH")
+	if dbPath == "" {
+		dbPath = "metadata.db"
+	}
+
+	db, err := pebble.Open(dbPath, &pebble.Options{})
 	if err != nil {
 		panic(fmt.Sprintf("Failed to open orchestrator metadata Pebble DB: %v", err))
 	}
@@ -224,6 +256,7 @@ func NewBackend(configPath string) *Backend {
 		cc:                NewClusterClient(allStorageNodes),
 		sfGroup:           NewSingleFlightGroup(),
 		killedNodes:       make(map[string]bool),
+		uploadsInFlight:   make(map[string]bool),
 		killedRaft:        make(map[string]bool),
 		raftDeadStreak:    make(map[string]int),
 		raftPromoted:      make(map[string]bool),
@@ -506,8 +539,8 @@ func (b *Backend) recoverIncompleteUploads() {
 
 // HandleNodes reports every physical storage node's online/offline network status to the frontend.
 func (b *Backend) HandleNodes(w http.ResponseWriter, r *http.Request) {
-	var statuses []NodeStatus
-
+	// Snapshot shared state under a short lock; the pings below are network
+	// calls (up to pingTimeout each) and must not run while holding b.mu.
 	b.mu.RLock()
 
 	allNodes := make(map[string]string, len(b.config.StorageNodes)+len(b.config.BackupNodeAddrs))
@@ -525,23 +558,43 @@ func (b *Backend) HandleNodes(w http.ResponseWriter, r *http.Request) {
 		backupSet[id] = true
 	}
 
-	for id, addr := range allNodes {
-		status := "ONLINE"
-
-		// If chaos test simulated a kill OR the physical gRPC connection is actually dead
-		if b.killedNodes[id] || !b.cc.PingNode(id) {
-			status = "OFFLINE"
-		}
-
-		statuses = append(statuses, NodeStatus{
-			ID:       id,
-			Addr:     addr,
-			Status:   status,
-			IsBackup: backupSet[id],
-		})
+	killed := make(map[string]bool, len(b.killedNodes))
+	for id, v := range b.killedNodes {
+		killed[id] = v
 	}
 
 	b.mu.RUnlock()
+
+	statuses := make([]NodeStatus, 0, len(allNodes))
+
+	var wg sync.WaitGroup
+	var smu sync.Mutex
+
+	for id, addr := range allNodes {
+		wg.Add(1)
+
+		go func(id, addr string) {
+			defer wg.Done()
+
+			status := "ONLINE"
+
+			// If chaos test simulated a kill OR the physical gRPC connection is actually dead
+			if killed[id] || !b.cc.PingNode(id) {
+				status = "OFFLINE"
+			}
+
+			smu.Lock()
+			statuses = append(statuses, NodeStatus{
+				ID:       id,
+				Addr:     addr,
+				Status:   status,
+				IsBackup: backupSet[id],
+			})
+			smu.Unlock()
+		}(id, addr)
+	}
+
+	wg.Wait()
 
 	sort.Slice(statuses, func(i, j int) bool {
 		return statuses[i].ID < statuses[j].ID
@@ -619,6 +672,11 @@ func (b *Backend) fetchRaftStatuses() map[string]map[string]interface{} {
 	}
 
 	wg.Wait()
+
+	// Any call (dashboard, watcher, /metrics) can be the first to see the
+	// new leader after a leader kill.
+	ObserveLeaderElectionIfPending(results)
+
 	return results
 }
 
@@ -759,6 +817,13 @@ func (b *Backend) HandleKillRaft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Find out whether this is the current leader before the partition is
+	// simulated, so the election that follows can be timed.
+	wasLeader := false
+	if st, found := b.fetchRaftStatuses()[nodeID]; found && st["state"] == "Leader" {
+		wasLeader = true
+	}
+
 	b.mu.Lock()
 	addr, ok := b.config.RaftNodes[nodeID]
 	if !ok {
@@ -766,13 +831,21 @@ func (b *Backend) HandleKillRaft(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown raft node %s", nodeID), http.StatusNotFound)
 		return
 	}
+	alreadyKilled := b.killedRaft[nodeID]
 	b.killedRaft[nodeID] = true
 	if b.raftLeaderAPI == deriveAPIAddr(addr) {
 		b.raftLeaderAPI = "" // don't keep routing writes to the "killed" leader
 	}
 	b.mu.Unlock()
 
+	if alreadyKilled {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	atomic.AddInt64(&b.killEventsTotal, 1)
+	if wasLeader {
+		MarkLeaderKilled()
+	}
 	b.logEvent(fmt.Sprintf("Chaos: simulated partition of raft node %s", nodeID))
 	w.WriteHeader(http.StatusOK)
 }
@@ -787,11 +860,14 @@ func (b *Backend) HandleReviveRaft(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.mu.Lock()
+	wasKilled := b.killedRaft[nodeID]
 	delete(b.killedRaft, nodeID)
 	delete(b.raftDeadStreak, nodeID)
 	b.mu.Unlock()
 
-	atomic.AddInt64(&b.reviveEventsTotal, 1)
+	if wasKilled {
+		atomic.AddInt64(&b.reviveEventsTotal, 1)
+	}
 	b.logEvent(fmt.Sprintf("Chaos: restored raft node %s", nodeID))
 	w.WriteHeader(http.StatusOK)
 }
@@ -935,6 +1011,18 @@ func (b *Backend) HandleKillNode(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("id")
 
 	b.mu.Lock()
+	_, isMain := b.config.StorageNodes[nodeID]
+	_, isBackup := b.config.BackupNodeAddrs[nodeID]
+	if nodeID == "" || (!isMain && !isBackup) {
+		b.mu.Unlock()
+		http.Error(w, fmt.Sprintf("unknown storage node %q", nodeID), http.StatusNotFound)
+		return
+	}
+	if b.killedNodes[nodeID] {
+		b.mu.Unlock()
+		w.WriteHeader(http.StatusOK) // already killed: idempotent, not a new event
+		return
+	}
 	b.killedNodes[nodeID] = true
 	b.mu.Unlock()
 	atomic.AddInt64(&b.killEventsTotal, 1)
@@ -1007,9 +1095,12 @@ func (b *Backend) HandleReviveNode(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("id")
 
 	b.mu.Lock()
+	wasKilled := b.killedNodes[nodeID]
 	delete(b.killedNodes, nodeID)
 	b.mu.Unlock()
-	atomic.AddInt64(&b.reviveEventsTotal, 1)
+	if wasKilled {
+		atomic.AddInt64(&b.reviveEventsTotal, 1)
+	}
 
 	fmt.Printf("=> Restoring Network Path to %s\n", nodeID)
 	b.restoreShardsHomeTo(nodeID)
@@ -1024,62 +1115,113 @@ func (b *Backend) restoreShardsHomeTo(nodeID string) {
 	healStart := time.Now()
 	ctx := context.Background()
 
+	type restoreTask struct {
+		fileID     string
+		chunkID    string
+		shardIdx   uint32
+		backupNode string
+	}
+
+	// Phase 1: snapshot what needs moving under a short read lock. The
+	// network copies below must NOT run while holding b.mu, or one slow node
+	// would block every writer (uploads, pins, deletes) for the duration.
+	var tasks []restoreTask
+
 	b.mu.RLock()
-
-	filesToUpdate := make(map[string]FileMeta)
-
 	for fileID, meta := range b.fileMeta {
-		needsUpdate := false
+		for _, mapping := range meta.Mappings {
+			chunkID := fmt.Sprintf("%s_%s", fileID, mapping.ShardID)
 
-		newChunkMap := make(map[string]string)
+			if meta.HomeMap[chunkID] == nodeID && meta.ChunkMap[chunkID] != nodeID {
+				tasks = append(tasks, restoreTask{
+					fileID:     fileID,
+					chunkID:    chunkID,
+					shardIdx:   shardIndexOf(mapping.ShardID),
+					backupNode: meta.ChunkMap[chunkID],
+				})
+			}
+		}
+	}
+	b.mu.RUnlock()
+
+	// Phase 2: copy shards back home without holding any lock.
+	moved := make(map[string][]restoreTask)
+
+	for _, t := range tasks {
+		data, checksum, err := b.cc.GetShard(ctx, t.backupNode, t.fileID, t.shardIdx)
+		if err != nil {
+			fmt.Printf("=> RS Restoration: could not read %s shard %d from %s to restore to %s: %v\n", t.fileID, t.shardIdx, t.backupNode, nodeID, err)
+			continue
+		}
+
+		if storeErr := b.cc.PutShard(ctx, nodeID, t.fileID, t.shardIdx, data, checksum); storeErr != nil {
+			fmt.Printf("=> RS Restoration: failed writing %s shard %d back to %s: %v\n", t.fileID, t.shardIdx, nodeID, storeErr)
+			continue
+		}
+
+		moved[t.fileID] = append(moved[t.fileID], t)
+	}
+
+	// Phase 3: apply the successful moves to a FRESH copy of each file's
+	// metadata (it may have changed during phase 2) and persist it.
+	restoredFiles := 0
+
+	for fileID, ts := range moved {
+		b.mu.RLock()
+		meta, ok := b.fileMeta[fileID]
+		if !ok {
+			b.mu.RUnlock()
+			continue // deleted while we were copying
+		}
+
+		newChunkMap := make(map[string]string, len(meta.ChunkMap))
 		for k, v := range meta.ChunkMap {
 			newChunkMap[k] = v
 		}
 
 		newMappings := make([]ShardMapping, len(meta.Mappings))
 		copy(newMappings, meta.Mappings)
+		b.mu.RUnlock()
 
-		for i, mapping := range newMappings {
-			chunkID := fmt.Sprintf("%s_%s", fileID, mapping.ShardID)
+		changed := false
 
-			if meta.HomeMap[chunkID] == nodeID && newChunkMap[chunkID] != nodeID {
-				shardUint := shardIndexOf(mapping.ShardID)
-				backupNode := newChunkMap[chunkID]
-
-				data, checksum, err := b.cc.GetShard(ctx, backupNode, fileID, shardUint)
-				if err != nil {
-					fmt.Printf("=> RS Restoration: could not read %s shard %d from %s to restore to %s: %v\n", fileID, shardUint, backupNode, nodeID, err)
-					continue
-				}
-
-				if storeErr := b.cc.PutShard(ctx, nodeID, fileID, shardUint, data, checksum); storeErr != nil {
-					fmt.Printf("=> RS Restoration: failed writing %s shard %d back to %s: %v\n", fileID, shardUint, nodeID, storeErr)
-					continue
-				}
-
-				newChunkMap[chunkID] = nodeID
-				newMappings[i].NodeID = nodeID
-				needsUpdate = true
+		for _, t := range ts {
+			// Only apply if the shard is still where we read it from.
+			if newChunkMap[t.chunkID] != t.backupNode {
+				continue
 			}
+
+			newChunkMap[t.chunkID] = nodeID
+
+			for i := range newMappings {
+				if fmt.Sprintf("%s_%s", fileID, newMappings[i].ShardID) == t.chunkID {
+					newMappings[i].NodeID = nodeID
+				}
+			}
+
+			changed = true
 		}
 
-		if needsUpdate {
-			meta.ChunkMap = newChunkMap
-			meta.Mappings = newMappings
-			filesToUpdate[fileID] = meta
+		if !changed {
+			continue
 		}
-	}
 
-	b.mu.RUnlock()
+		meta.ChunkMap = newChunkMap
+		meta.Mappings = newMappings
 
-	for fileID, meta := range filesToUpdate {
 		if err := b.saveMeta(fileID, meta); err != nil {
 			b.logEvent(fmt.Sprintf("WARNING: restore of %s applied locally but Raft commit failed: %v", fileID, err))
 		}
+
+		restoredFiles++
 		fmt.Printf("=> RS Restoration: Pulled shards back home to %s for file %s\n", nodeID, fileID)
 	}
 
-	healLatencyMs.Observe(float64(time.Since(healStart).Milliseconds()))
+	// Only a restore that actually moved shards is a "heal"; reviving a node
+	// that had nothing rerouted would just pollute the histogram.
+	if restoredFiles > 0 {
+		healLatencyMs.Observe(float64(time.Since(healStart).Milliseconds()))
+	}
 }
 
 // startStorageFailoverWatcher is the storage-node equivalent of
@@ -1150,19 +1292,25 @@ func (b *Backend) startStorageFailoverWatcher() {
 func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	atomic.AddInt64(&b.uploadRequestsTotal, 1)
-	defer func() {
-		b.uploadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
-	}()
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if err := r.ParseMultipartForm(1000 << 20); err != nil {
+	// Cap the request body, and keep at most 32 MB of the form in RAM
+	// (anything bigger spills to temp files that are removed below).
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+(1<<20))
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, fmt.Sprintf("File exceeds the %d MB limit.", maxUploadSize>>20), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Failed to parse multipart form", http.StatusBadRequest)
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -1170,8 +1318,8 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if header.Size > 1000<<20 {
-		http.Error(w, "File exceeds the 32 MB limit.", http.StatusRequestEntityTooLarge)
+	if header.Size > maxUploadSize {
+		http.Error(w, fmt.Sprintf("File exceeds the %d MB limit.", maxUploadSize>>20), http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -1205,18 +1353,30 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 
 	b.mu.Lock()
 
-	if _, exists := b.fileMeta[fileID]; exists {
+	if _, exists := b.fileMeta[fileID]; exists || b.uploadsInFlight[fileID] {
 		b.mu.Unlock()
 		http.Error(w, fmt.Sprintf("File ID '%s' is already in use.", fileID), http.StatusConflict)
 		return
 	}
 
+	// Reserve the ID before unlocking so a concurrent upload of the same ID
+	// is rejected instead of racing this one.
+	b.uploadsInFlight[fileID] = true
 	b.mu.Unlock()
+
+	defer func() {
+		b.mu.Lock()
+		delete(b.uploadsInFlight, fileID)
+		b.mu.Unlock()
+	}()
 
 	b.beginUploadWAL(fileID)
 
-	var mainNodes []string
+	// Skip nodes under a simulated partition (/kill-node) so chaos tests
+	// behave like a real outage: new shards must not land on a "dead" node.
+	var mainNodes, liveBackups []string
 
+	b.mu.RLock()
 	for id := range b.config.StorageNodes {
 		isBackup := false
 
@@ -1226,9 +1386,28 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if !isBackup {
+		if !isBackup && !b.killedNodes[id] {
 			mainNodes = append(mainNodes, id)
 		}
+	}
+
+	for _, id := range b.config.BackupNodes {
+		if !b.killedNodes[id] {
+			liveBackups = append(liveBackups, id)
+		}
+	}
+	if len(liveBackups) == 0 {
+		// Every backup is partitioned: keep the full list so indexing stays
+		// valid; the redundancy writes will simply fail and be recorded as
+		// "no backup copy".
+		liveBackups = append(liveBackups, b.config.BackupNodes...)
+	}
+	b.mu.RUnlock()
+
+	if len(mainNodes) == 0 || len(liveBackups) == 0 {
+		b.commitUploadWAL(fileID)
+		http.Error(w, "No reachable storage nodes available", http.StatusServiceUnavailable)
+		return
 	}
 
 	// Sort to ensure deterministic shard distribution across the physical cluster
@@ -1257,7 +1436,7 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		checksumMap[fullChunkKey] = checksum
 
 		homeNode := mainNodes[i%len(mainNodes)]
-		backupNode := b.config.BackupNodes[i%len(b.config.BackupNodes)]
+		backupNode := liveBackups[i%len(liveBackups)]
 
 		targetNode := homeNode
 
@@ -1391,6 +1570,9 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 
 	b.commitUploadWAL(fileID)
 	atomic.AddInt64(&b.uploadSuccessTotal, 1)
+	// Latency is recorded for successful uploads only, so failed/rejected
+	// requests don't mix into the same histogram.
+	b.uploadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Upload successful"))
@@ -1446,15 +1628,16 @@ func (b *Backend) fetchShardAdaptive(
 				fileID,
 				shardIdx,
 			)
-			shardFetchLatencyMs.Observe(float64(time.Since(fetchStart).Milliseconds()))
 
 			// If the race was already decided by another goroutine, this
 			// fetch was cancelled out from under us - don't count it as a
-			// genuine failure, it just lost the race.
+			// genuine failure (or a latency sample), it just lost the race.
 			if raceCtx.Err() != nil {
 				resCh <- result{}
 				return
 			}
+
+			shardFetchLatencyMs.Observe(float64(time.Since(fetchStart).Microseconds()) / 1000.0)
 
 			if err != nil || len(data) == 0 || !verifyChecksum(data, checksum) {
 				atomic.AddInt64(&b.shardFetchFailTotal, 1)
@@ -1561,10 +1744,24 @@ func (b *Backend) downloadFileAdaptive(
 			}
 		}
 
+		// Reconstruction is only "needed" when a data shard is missing; the
+		// early exit above leaves parity shards nil on purpose, so only look
+		// at the data shards.
+		needsReconstruction := false
+		for i := 0; i < meta.DataShards && i < len(shards); i++ {
+			if shards[i] == nil {
+				needsReconstruction = true
+				break
+			}
+		}
+
 		fileOut, err := reconstructAndJoin(shards, int(meta.Size))
-		atomic.AddInt64(&b.reconstructTotal, 1)
 		if err != nil {
 			return nil, "", err
+		}
+
+		if needsReconstruction {
+			atomic.AddInt64(&b.reconstructTotal, 1)
 		}
 
 		return fileOut, meta.Name, nil
@@ -1578,8 +1775,12 @@ func (b *Backend) downloadFileAdaptive(
 }
 
 func (b *Backend) HandleStats(w http.ResponseWriter, r *http.Request) {
+	b.mu.RLock()
+	totalFiles := len(b.fileMeta)
+	b.mu.RUnlock()
+
 	stats := map[string]interface{}{
-		"total_files":       len(b.fileMeta),
+		"total_files":       totalFiles,
 		"total_views":       atomic.LoadInt64(&b.sfViews),
 		"download_requests": atomic.LoadInt64(&b.sfTotal),
 		"deduped_requests":  atomic.LoadInt64(&b.sfDeduped),
@@ -1591,9 +1792,6 @@ func (b *Backend) HandleStats(w http.ResponseWriter, r *http.Request) {
 
 func (b *Backend) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	defer func() {
-		b.downloadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
-	}()
 
 	fileID := r.URL.Query().Get("id")
 
@@ -1602,10 +1800,14 @@ func (b *Backend) HandleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fileOut, name, err := b.downloadFileAdaptive(fileID, true); err == nil {
-		w.Header().Set(
-			"Content-Disposition",
-			fmt.Sprintf("attachment; filename=\"%s\"", name),
-		)
+		// mime.FormatMediaType quotes/encodes the name, so a filename with
+		// quotes or newlines can't inject extra header content.
+		cd := mime.FormatMediaType("attachment", map[string]string{"filename": name})
+		if cd == "" {
+			cd = "attachment"
+		}
+		w.Header().Set("Content-Disposition", cd)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 
 		w.Header().Set(
 			"Content-Type",
@@ -1614,6 +1816,7 @@ func (b *Backend) HandleDownload(w http.ResponseWriter, r *http.Request) {
 
 		w.Write(fileOut)
 		atomic.AddInt64(&b.downloadSuccessTotal, 1)
+		b.downloadLatencyMs.Observe(float64(time.Since(start).Milliseconds()))
 		b.touchLastAccessed(fileID)
 		return
 	}
@@ -1631,11 +1834,6 @@ func (b *Backend) HandleView(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&b.sfViews, 1)
 
 	if fileOut, name, err := b.downloadFileAdaptive(fileID, false); err == nil {
-		w.Header().Set(
-			"Content-Disposition",
-			fmt.Sprintf("inline; filename=\"%s\"", name),
-		)
-
 		ext := strings.ToLower(filepath.Ext(name))
 		var ct string
 
@@ -1654,6 +1852,24 @@ func (b *Backend) HandleView(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// HTML/SVG/XML can run scripts on this origin (stored XSS), so they are
+		// never shown inline - the browser downloads them instead.
+		disposition := "inline"
+		lowerCT := strings.ToLower(ct)
+		for _, risky := range []string{"text/html", "application/xhtml", "image/svg", "text/xml", "application/xml"} {
+			if strings.HasPrefix(lowerCT, risky) {
+				disposition = "attachment"
+				ct = "application/octet-stream"
+				break
+			}
+		}
+
+		cd := mime.FormatMediaType(disposition, map[string]string{"filename": name})
+		if cd == "" {
+			cd = disposition
+		}
+		w.Header().Set("Content-Disposition", cd)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Type", ct)
 		w.Write(fileOut)
 		b.touchLastAccessed(fileID)
@@ -1663,19 +1879,69 @@ func (b *Backend) HandleView(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Failed to view file", http.StatusInternalServerError)
 }
 
-func (b *Backend) touchLastAccessed(fileID string) {
-	b.mu.Lock()
+var errMetaNotFound = errors.New("file not found")
 
-	meta, exists := b.fileMeta[fileID]
+// updateMeta changes a file's metadata without clobbering concurrent changes.
+// mutate must set ABSOLUTE values (not toggle or increment) because it runs
+// twice: once on a snapshot that goes to Raft, and again on whatever copy is
+// current after the commit, so a reroute/restore that landed during the
+// (slow) Raft round trip keeps its ChunkMap/Mappings instead of being
+// overwritten by a stale copy. mutate returns false when nothing needs to
+// change, in which case no Raft write happens.
+func (b *Backend) updateMeta(fileID string, mutate func(*FileMeta) bool) (bool, error) {
+	b.mu.RLock()
+	meta, ok := b.fileMeta[fileID]
+	b.mu.RUnlock()
 
-	b.mu.Unlock()
-
-	if !exists {
-		return
+	if !ok {
+		return false, errMetaNotFound
 	}
 
-	meta.LastAccessed = time.Now().Unix()
-	if err := b.saveMeta(fileID, meta); err != nil {
+	if !mutate(&meta) {
+		return false, nil
+	}
+
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return false, fmt.Errorf("marshal meta: %w", err)
+	}
+
+	if err := b.raftApply(LogCommand{Operation: "SET_META", Payload: payload}); err != nil {
+		fmt.Printf("[Raft] SET_META failed for %s: %v\n", fileID, err)
+		return false, fmt.Errorf("raft commit failed: %w", err)
+	}
+
+	b.mu.Lock()
+	cur, ok := b.fileMeta[fileID]
+	if !ok {
+		b.mu.Unlock()
+		return false, errMetaNotFound // deleted while we were committing
+	}
+	mutate(&cur)
+	b.fileMeta[fileID] = cur
+	curBytes, _ := json.Marshal(cur)
+	b.mu.Unlock()
+
+	_ = b.db.Set([]byte("file:"+fileID), curBytes, pebble.Sync)
+	return true, nil
+}
+
+// lastAccessedGranularity is how stale LastAccessed may get before a view or
+// download refreshes it. The only consumer is the 30-day TTL sweeper, so hour
+// resolution is plenty - and it keeps reads from becoming Raft writes.
+const lastAccessedGranularity = int64(60 * 60)
+
+func (b *Backend) touchLastAccessed(fileID string) {
+	now := time.Now().Unix()
+
+	_, err := b.updateMeta(fileID, func(m *FileMeta) bool {
+		if now-m.LastAccessed < lastAccessedGranularity {
+			return false
+		}
+		m.LastAccessed = now
+		return true
+	})
+	if err != nil && !errors.Is(err, errMetaNotFound) {
 		fmt.Printf("[Raft] last-accessed update for %s not committed: %v\n", fileID, err)
 	}
 }
@@ -1693,6 +1959,17 @@ func contentTypeFor(name, disposition string) string {
 }
 
 func (b *Backend) HandleDelete(w http.ResponseWriter, r *http.Request) {
+	// GET must never delete (an <img src="/delete?id=..."> on any web page
+	// would trigger it). The dashboard already uses DELETE.
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
+
 	fileID := r.URL.Query().Get("id")
 
 	if fileID == "" {
@@ -1796,12 +2073,19 @@ func (b *Backend) startUnifiedSweeper() {
 }
 
 func (b *Backend) HandleTogglePin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
+
 	fileID := r.URL.Query().Get("id")
 
 	b.mu.RLock()
-
-	meta, exists := b.fileMeta[fileID]
-
+	current, exists := b.fileMeta[fileID]
 	b.mu.RUnlock()
 
 	if !exists {
@@ -1809,8 +2093,20 @@ func (b *Backend) HandleTogglePin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta.IsPinned = !meta.IsPinned
-	if err := b.saveMetaRaftFirst(fileID, meta); err != nil {
+	// Decide the target once, then set it absolutely (see updateMeta).
+	target := !current.IsPinned
+	_, err := b.updateMeta(fileID, func(m *FileMeta) bool {
+		if m.IsPinned == target {
+			return false
+		}
+		m.IsPinned = target
+		return true
+	})
+	if errors.Is(err, errMetaNotFound) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
 		http.Error(w, "Consensus failed: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}

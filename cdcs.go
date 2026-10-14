@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // ClusterClient is the single place gRPC connections to other nodes are
@@ -43,12 +44,23 @@ var pingTimeout = func() time.Duration {
 }()
 
 func NewClusterClient(nodes map[string]string) *ClusterClient {
+	// When CDCS_ADMIN_TOKEN is set, every outgoing call carries it so the
+	// storage nodes (which check it) accept this orchestrator.
+	token := os.Getenv("CDCS_ADMIN_TOKEN")
+	addToken := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if token != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-admin-token", token)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+
 	cacheClients := make(map[string]pb.CacheServiceClient)
 	replClients := make(map[string]pb.ReplicationServiceClient)
 	for id, addr := range nodes {
 		conn, err := grpc.Dial(
 			addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithUnaryInterceptor(addToken),
 			grpc.WithDefaultCallOptions(
 				grpc.MaxCallSendMsgSize(maxShardMsgSize),
 				grpc.MaxCallRecvMsgSize(maxShardMsgSize),

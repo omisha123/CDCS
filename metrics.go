@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,6 +103,54 @@ var (
 	evictionFailTotal   int64
 )
 
+// lastNodeStats remembers the most recent GetCacheStats reply from every
+// storage node. When a node is unreachable at scrape time its last known
+// counters are still summed in, so the cluster-wide counters never go
+// backwards just because a node is briefly down (Prometheus would read a
+// decrease as a counter reset and rate() would spike).
+var (
+	nodeStatsMu   sync.Mutex
+	lastNodeStats = make(map[string]*pb.StatsResponse)
+)
+
+// leaderKillStartNs is the unix-nano time at which the current Raft leader
+// was killed, or 0 when no election is being timed.
+var leaderKillStartNs int64
+
+// MarkLeaderKilled starts the leader-election stopwatch.
+func MarkLeaderKilled() {
+	atomic.StoreInt64(&leaderKillStartNs, time.Now().UnixNano())
+}
+
+// ObserveLeaderElectionIfPending records cdcs_leader_election_duration_ms
+// once a live node reports itself Leader after the old leader was killed.
+func ObserveLeaderElectionIfPending(live map[string]map[string]interface{}) {
+	start := atomic.LoadInt64(&leaderKillStartNs)
+	if start == 0 {
+		return
+	}
+
+	for _, entry := range live {
+		if entry["state"] != "Leader" {
+			continue
+		}
+
+		// CAS so concurrent callers (watcher, dashboard, /metrics) record once.
+		if atomic.CompareAndSwapInt64(&leaderKillStartNs, start, 0) {
+			leaderElectionLatencyMs.Observe(float64(time.Now().UnixNano()-start) / 1e6)
+		}
+
+		return
+	}
+}
+
+// processHandle is reused across scrapes: gopsutil's Percent(0) reports CPU
+// use since the previous call on the same handle.
+var (
+	procOnce   sync.Once
+	procHandle *process.Process
+)
+
 func ObserveCacheHitLatency(v float64) {
 	cacheHitLatencyMs.Observe(v)
 }
@@ -174,6 +223,89 @@ func directorySize(root string) int64 {
 	})
 
 	return total
+}
+
+// dirSizeTTL bounds how often a storage node re-walks its storage directory.
+// Walking every shard file on every 5s scrape gets expensive as the node
+// fills up; a few seconds of staleness is fine for a size gauge.
+const dirSizeTTL = 10 * time.Second
+
+type dirSizeEntry struct {
+	size int64
+	at   time.Time
+}
+
+var (
+	dirSizeMu    sync.Mutex
+	dirSizeCache = make(map[string]dirSizeEntry)
+)
+
+func cachedDirectorySize(root string) int64 {
+	dirSizeMu.Lock()
+	e, ok := dirSizeCache[root]
+	dirSizeMu.Unlock()
+
+	if ok && time.Since(e.at) < dirSizeTTL {
+		return e.size
+	}
+
+	size := directorySize(root)
+
+	dirSizeMu.Lock()
+	dirSizeCache[root] = dirSizeEntry{size: size, at: time.Now()}
+	dirSizeMu.Unlock()
+
+	return size
+}
+
+// HandleTestReport lets an external test harness feed the correctness
+// counters that nothing inside the cluster increments on its own:
+//
+//	POST /test-report?kind=byte_match|metadata_consistency|reconstruction|eviction&pass=true|false
+//	POST /test-report?kind=stampede&requests=N&fetches=M
+func (b *Backend) HandleTestReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	kind := q.Get("kind")
+
+	if kind == "stampede" {
+		requests, err1 := strconv.ParseInt(q.Get("requests"), 10, 64)
+		fetches, err2 := strconv.ParseInt(q.Get("fetches"), 10, 64)
+		if err1 != nil || err2 != nil || requests < 0 || fetches < 0 {
+			http.Error(w, "stampede needs non-negative integer ?requests= and ?fetches=", http.StatusBadRequest)
+			return
+		}
+
+		ObserveStampede(requests, fetches)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	pass, err := strconv.ParseBool(q.Get("pass"))
+	if err != nil {
+		http.Error(w, "missing or invalid ?pass=true|false", http.StatusBadRequest)
+		return
+	}
+
+	switch kind {
+	case "byte_match":
+		ObserveByteMatch(pass)
+	case "metadata_consistency":
+		ObserveMetadataConsistency(pass)
+	case "reconstruction":
+		ObserveReconstructionTest(pass)
+	case "eviction":
+		ObserveEvictionCheck(pass)
+	default:
+		http.Error(w, "unknown ?kind= (byte_match, metadata_consistency, reconstruction, eviction, stampede)", http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -257,7 +389,7 @@ func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		}(id)
 	}
 
-	nodeStats := make(map[string]*pb.StatsResponse, len(clients))
+	nodeStats := make(map[string]*pb.StatsResponse, len(clients)) // live replies only
 	for id, c := range clients {
 		wg.Add(1)
 
@@ -495,11 +627,23 @@ func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	aggHitLatency := NewHistogram(cacheHitLatencyMs.buckets)
 	aggMissLatency := NewHistogram(cacheMissLatencyMs.buckets)
 
-	for _, s := range nodeStats {
+	// Refresh the last-known snapshot with this scrape's live replies, then
+	// sum counters/histograms over the snapshot so an unreachable node keeps
+	// contributing its last value instead of making the totals drop.
+	nodeStatsMu.Lock()
+	for id, s := range nodeStats {
+		lastNodeStats[id] = s
+	}
+	counterStats := make([]*pb.StatsResponse, 0, len(lastNodeStats))
+	for _, s := range lastNodeStats {
+		counterStats = append(counterStats, s)
+	}
+	nodeStatsMu.Unlock()
+
+	for _, s := range counterStats {
 		memHits += s.MemHits
 		diskHits += s.DiskHits
 		missCount += s.Misses
-		totalStorageBytes += s.StorageBytes
 
 		// Skip a node whose histogram doesn't match our bucket layout
 		// (e.g. still running an older build without these fields).
@@ -520,12 +664,19 @@ func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Storage size is a gauge: only nodes that answered right now count.
+	for _, s := range nodeStats {
+		totalStorageBytes += s.StorageBytes
+	}
+
 	cacheMisses := diskHits + missCount
 	cacheTotal := memHits + cacheMisses
 
-	hitRatio := 0.0
+	// strict: RAM-only. overall: RAM + disk, i.e. the shard was found on the node.
+	strictHitRatio, overallHitRatio := 0.0, 0.0
 	if cacheTotal > 0 {
-		hitRatio = float64(memHits) / float64(cacheTotal)
+		strictHitRatio = float64(memHits) / float64(cacheTotal)
+		overallHitRatio = float64(memHits+diskHits) / float64(cacheTotal)
 	}
 
 	fmt.Fprintln(w, "# HELP cdcs_cache_hits_total Shard reads served from RAM (2Q cache hit)")
@@ -536,13 +687,13 @@ func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE cdcs_cache_misses_total counter")
 	fmt.Fprintf(w, "cdcs_cache_misses_total %d\n", cacheMisses)
 
-	fmt.Fprintln(w, "# HELP cdcs_cache_hit_ratio Cumulative 2Q cache hit ratio")
+	fmt.Fprintln(w, "# HELP cdcs_cache_hit_ratio Cumulative fraction of shard reads found on the node (RAM or disk)")
 	fmt.Fprintln(w, "# TYPE cdcs_cache_hit_ratio gauge")
-	fmt.Fprintf(w, "cdcs_cache_hit_ratio %f\n", hitRatio)
+	fmt.Fprintf(w, "cdcs_cache_hit_ratio %f\n", overallHitRatio)
 
 	fmt.Fprintln(w, "# HELP cdcs_strict_cache_hit_ratio Strict RAM-only 2Q cache hit ratio")
 	fmt.Fprintln(w, "# TYPE cdcs_strict_cache_hit_ratio gauge")
-	fmt.Fprintf(w, "cdcs_strict_cache_hit_ratio %f\n", hitRatio)
+	fmt.Fprintf(w, "cdcs_strict_cache_hit_ratio %f\n", strictHitRatio)
 
 	fmt.Fprintln(w, "# HELP cdcs_cache_hit_duration_ms Cache hit latency")
 	fmt.Fprintln(w, "# TYPE cdcs_cache_hit_duration_ms histogram")
@@ -659,8 +810,17 @@ func (b *Backend) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE cdcs_process_goroutines gauge")
 	fmt.Fprintf(w, "cdcs_process_goroutines %d\n", runtime.NumGoroutine())
 
-	if p, err := process.NewProcess(int32(os.Getpid())); err == nil {
-		if cpu, err := p.CPUPercent(); err == nil {
+	procOnce.Do(func() {
+		if p, err := process.NewProcess(int32(os.Getpid())); err == nil {
+			procHandle = p
+			_, _ = p.Percent(0) // prime the baseline for the next scrape
+		}
+	})
+
+	if p := procHandle; p != nil {
+		// Percent(0) = CPU use since the previous scrape (CPUPercent() is a
+		// lifetime average since process start, not "current").
+		if cpu, err := p.Percent(0); err == nil {
 			fmt.Fprintln(w, "# HELP cdcs_process_cpu_percent Current Go process CPU utilization")
 			fmt.Fprintln(w, "# TYPE cdcs_process_cpu_percent gauge")
 			fmt.Fprintf(w, "cdcs_process_cpu_percent %f\n", cpu)

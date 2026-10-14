@@ -5,11 +5,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync/atomic"
 	"time"
 
 	pb "cdcs1/cdcspb"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// shardIDPattern is the only shape of file ID a storage node will accept.
+// The orchestrator already sanitizes IDs on upload, but the gRPC port is
+// reachable directly, so the node has to check too (a FileId like
+// "../../x" would otherwise write outside storageDir).
+var shardIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,200}$`)
+
+func validShardRequest(fileID string, shardIndex int32) error {
+	if !shardIDPattern.MatchString(fileID) || shardIndex < 0 {
+		return status.Error(codes.InvalidArgument, "invalid file id or shard index")
+	}
+	return nil
+}
 
 // Server defines the core gRPC server object for your nodes.
 type Server struct {
@@ -68,6 +85,9 @@ func (s *Server) InspectCache(ctx context.Context, req *pb.InspectRequest) (*pb.
 // =====================================================================
 
 func (s *Server) PutShard(ctx context.Context, req *pb.ShardRequest) (*pb.ShardResponse, error) {
+	if err := validShardRequest(req.FileId, req.ShardIndex); err != nil {
+		return &pb.ShardResponse{Success: false}, err
+	}
 	chunkName := fmt.Sprintf("%s_shard_%d", req.FileId, req.ShardIndex)
 	path := filepath.Join(s.storageDir, chunkName)
 
@@ -80,6 +100,9 @@ func (s *Server) PutShard(ctx context.Context, req *pb.ShardRequest) (*pb.ShardR
 }
 
 func (s *Server) GetShard(ctx context.Context, req *pb.ShardRequest) (*pb.ShardResponse, error) {
+	if err := validShardRequest(req.FileId, req.ShardIndex); err != nil {
+		return &pb.ShardResponse{Success: false}, err
+	}
 	chunkName := fmt.Sprintf("%s_shard_%d", req.FileId, req.ShardIndex)
 
 	// 1. RAM hit
@@ -110,6 +133,9 @@ func (s *Server) GetShard(ctx context.Context, req *pb.ShardRequest) (*pb.ShardR
 }
 
 func (s *Server) DeleteShard(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	if err := validShardRequest(req.Key, req.ShardIndex); err != nil {
+		return &pb.DeleteResponse{Success: false}, err
+	}
 	chunkName := fmt.Sprintf("%s_shard_%d", req.Key, req.ShardIndex)
 	path := filepath.Join(s.storageDir, chunkName)
 
@@ -135,7 +161,7 @@ func (s *Server) GetCacheStats(ctx context.Context, req *pb.StatsRequest) (*pb.S
 		MemHits:           atomic.LoadInt64(&s.memHits),
 		DiskHits:          atomic.LoadInt64(&s.diskHits),
 		Misses:            atomic.LoadInt64(&s.misses),
-		StorageBytes:      directorySize(s.storageDir),
+		StorageBytes:      cachedDirectorySize(s.storageDir),
 		HitLatencyCounts:  hitCounts,
 		HitLatencySum:     hitSum,
 		HitLatencyCount:   hitCount,

@@ -35,6 +35,12 @@ type TwoQEngine struct {
 	a1inCap  int // target size of A1in (only enforced when the cache is full)
 	a1outCap int // max ghost keys
 
+	// Byte budget. Entries are whole shards (up to ~25 MB each for a 100 MB
+	// upload), so an entry-count cap alone can pin gigabytes of RAM. The cache
+	// is "full" when EITHER limit is exceeded.
+	bytes    int64 // payload bytes held by real entries (a1in + am)
+	maxBytes int64
+
 	a1in  *list.List
 	a1out *list.List
 	am    *list.List
@@ -50,11 +56,23 @@ func NewTwoQEngine(totalCapacity int) *TwoQEngine {
 		capacity: totalCapacity,
 		a1inCap:  totalCapacity / 4,
 		a1outCap: totalCapacity / 2,
+		maxBytes: 256 << 20, // 256 MB default; override with SetMaxBytes
 		a1in:     list.New(),
 		a1out:    list.New(),
 		am:       list.New(),
 		items:    make(map[string]*list.Element),
 	}
+}
+
+// SetMaxBytes sets the RAM budget for cached payloads (<= 0 keeps the default).
+func (c *TwoQEngine) SetMaxBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.maxBytes = n
+	c.reclaim()
+	c.mu.Unlock()
 }
 
 // Get returns data only for real (in-memory) entries. Ghosts are misses.
@@ -92,19 +110,25 @@ func (c *TwoQEngine) Put(key string, data []byte) {
 			// Seen again after leaving A1in: genuinely hot, promote to Am.
 			c.a1out.Remove(el)
 			entry.Data = data
+			c.bytes += int64(len(data)) // ghosts hold no payload
 			entry.queue = qAm
 			c.items[key] = c.am.PushFront(entry)
 			c.reclaim()
 		case qAm:
+			c.bytes += int64(len(data) - len(entry.Data))
 			entry.Data = data
 			c.am.MoveToFront(el)
+			c.reclaim()
 		default: // qA1in
+			c.bytes += int64(len(data) - len(entry.Data))
 			entry.Data = data
+			c.reclaim()
 		}
 		return
 	}
 
 	entry := &CacheEntry{Key: key, Data: data, queue: qA1in}
+	c.bytes += int64(len(data))
 	c.items[key] = c.a1in.PushFront(entry)
 	c.reclaim()
 }
@@ -118,6 +142,7 @@ func (c *TwoQEngine) Delete(key string) {
 	if !found {
 		return
 	}
+	c.bytes -= int64(len(el.Value.(*CacheEntry).Data)) // 0 for ghosts
 	switch el.Value.(*CacheEntry).queue {
 	case qA1in:
 		c.a1in.Remove(el)
@@ -145,12 +170,14 @@ func (c *TwoQEngine) Inspect() InspectResult {
 // Until then, A1in is allowed to use any free space, so the cache never
 // ghosts entries while RAM sits empty.
 func (c *TwoQEngine) reclaim() {
-	for c.a1in.Len()+c.am.Len() > c.capacity {
+	for c.a1in.Len()+c.am.Len() > 0 &&
+		(c.a1in.Len()+c.am.Len() > c.capacity || c.bytes > c.maxBytes) {
 		if c.a1in.Len() > c.a1inCap || c.am.Len() == 0 {
 			// A1in is over its share: demote its oldest entry to a ghost.
 			el := c.a1in.Back()
 			c.a1in.Remove(el)
 			entry := el.Value.(*CacheEntry)
+			c.bytes -= int64(len(entry.Data))
 			entry.Data = nil
 			entry.queue = qA1out
 			c.items[entry.Key] = c.a1out.PushFront(entry)
@@ -158,6 +185,7 @@ func (c *TwoQEngine) reclaim() {
 			// Otherwise evict the least recently used hot entry outright.
 			el := c.am.Back()
 			c.am.Remove(el)
+			c.bytes -= int64(len(el.Value.(*CacheEntry).Data))
 			delete(c.items, el.Value.(*CacheEntry).Key)
 		}
 	}

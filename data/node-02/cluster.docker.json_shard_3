@@ -1,0 +1,12 @@
+t-06": "raft-06:60051",
+    "Raft-07": "raft-07:60051"
+  },
+  "backup_nodes": [
+    "Node-07",
+    "Node-08"
+  ],
+  "raft_backup_nodes": [
+    "Raft-06",
+    "Raft-07"
+  ]
+}

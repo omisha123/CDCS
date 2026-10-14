@@ -17,14 +17,14 @@ const (
 )
 
 // encodeFileToShards mathematically slices the raw byte data into 4 distinct data shards 
-// and calculates 2 additional parity shards for fault tolerance[cite: 5].
+// and calculates 2 additional parity shards for fault tolerance.
 func encodeFileToShards(data []byte) ([][]byte, error) {
 	enc, err := reedsolomon.New(rsDataShards, rsParityShards)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Reed-Solomon encoder: %w", err)
 	}
 
-	// Calculate uniform shard size and pad the raw byte array so it divides evenly[cite: 5]
+	// Calculate uniform shard size and pad the raw byte array so it divides evenly
 	shardSize := (len(data) + rsDataShards - 1) / rsDataShards
 	paddedSize := shardSize * rsDataShards
 	
@@ -36,7 +36,7 @@ func encodeFileToShards(data []byte) ([][]byte, error) {
 		return nil, fmt.Errorf("failed to split data into shards: %w", err)
 	}
 
-	// Compute the 2 parity shards on top of the padded data[cite: 5]
+	// Compute the 2 parity shards on top of the padded data
 	if err := enc.Encode(shards); err != nil {
 		return nil, fmt.Errorf("failed to encode parity shards: %w", err)
 	}
@@ -44,27 +44,24 @@ func encodeFileToShards(data []byte) ([][]byte, error) {
 	return shards, nil
 }
 
-// reconstructAndJoin evaluates the 6 shards (where missing shards are nil)[cite: 5].
+// reconstructAndJoin evaluates the 6 shards (where missing shards are nil).
 // As long as up to 2 shards are missing, it rebuilds them, stitches the data together, 
-// and trims the padding back to the original size[cite: 5].
+// and trims the padding back to the original size.
 func reconstructAndJoin(shards [][]byte, originalSize int) ([]byte, error) {
 	enc, err := reedsolomon.New(rsDataShards, rsParityShards)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Reed-Solomon encoder: %w", err)
 	}
 
-	// Mathematically rebuild the missing pieces if possible[cite: 5]
-	if err := enc.Reconstruct(shards); err != nil {
+	// Rebuild only the missing DATA shards. Join needs nothing else, so this
+	// skips recomputing parity. Verify is dropped on purpose: the download
+	// path exits early with parity shards nil, so it could not run anyway,
+	// and every shard is already checked against its SHA-256 on fetch.
+	if err := enc.ReconstructData(shards); err != nil {
 		return nil, fmt.Errorf("reconstruction failed (too many lost shards): %w", err)
 	}
 
-	// Verify the integrity of the rebuilt shards
-	ok, err := enc.Verify(shards)
-	if !ok || err != nil {
-		return nil, fmt.Errorf("shard verification failed after reconstruction")
-	}
-
-	// Stitch the data shards together and trim the padding back to the originalSize[cite: 5]
+	// Stitch the data shards together and trim the padding back to the originalSize
 	out := new(bytes.Buffer)
 	if err := enc.Join(out, shards, originalSize); err != nil {
 		return nil, fmt.Errorf("failed to join data shards: %w", err)
