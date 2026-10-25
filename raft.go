@@ -6,10 +6,12 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 // MetadataFSM is the Raft state machine. Every Raft node runs its own copy.
@@ -172,14 +174,32 @@ func SetupRaftNode(nodeID, bindAddr, advertiseAddr string, peers map[string]stri
 		return nil, nil, fmt.Errorf("failed to create TCP transport: %w", err)
 	}
 
-	// Keep the existing in-memory Raft storage design.
-	logStore := raft.NewInmemStore()
-	stableStore := raft.NewInmemStore()
-	snapshotStore := raft.NewDiscardSnapshotStore()
+	// Persistent Raft storage. Each node has its own directory (a separate
+	// docker-compose volume), so there is no cross-container file locking.
+	// One BoltDB file serves as both the log store and the stable store
+	// (current term / voted-for), so a restarted node keeps its Raft state.
+	dir := os.Getenv("RAFT_DATA_DIR")
+	if dir == "" {
+		dir = "/app/raft" // matches the docker-compose volume mounts
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("raft data dir: %w", err)
+	}
+
+	boltStore, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("raft store: %w", err)
+	}
+
+	snapshotStore, err := raft.NewFileSnapshotStore(dir, 2, os.Stderr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("raft snapshots: %w", err)
+	}
 
 	fsm := NewMetadataFSM()
 
-	r, err := raft.NewRaft(config, fsm, logStore, stableStore, snapshotStore, transport)
+	r, err := raft.NewRaft(config, fsm, boltStore, boltStore, snapshotStore, transport)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create raft node: %w", err)
 	}
@@ -188,6 +208,9 @@ func SetupRaftNode(nodeID, bindAddr, advertiseAddr string, peers map[string]stri
 	//
 	// Backup Raft nodes receive an empty peers map and therefore do not
 	// bootstrap themselves into the active five-node consensus group.
+	//
+	// On a restart with saved state, BootstrapCluster returns
+	// ErrCantBootstrap, which is expected and ignored below.
 	if len(peers) > 0 {
 		servers := make([]raft.Server, 0, len(peers))
 

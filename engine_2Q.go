@@ -9,6 +9,7 @@ import (
 type CacheEntry struct {
 	Key  string
 	Data []byte
+	InAm bool
 }
 
 // InspectResult packages the queue states for the orchestrator's dashboard.
@@ -49,7 +50,7 @@ func NewTwoQEngine(totalCapacity int) *TwoQEngine {
 	}
 }
 
-// Get retrieves data and handles queue promotion if a ghost key is accessed.
+// Get retrieves data; hot (Am) entries are moved to the front of the LRU.
 func (c *TwoQEngine) Get(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -59,18 +60,19 @@ func (c *TwoQEngine) Get(key string) ([]byte, bool) {
 		return nil, false
 	}
 
-	// If it's in the A1out ghost cache, it's genuinely hot. Promote to Am (LRU).
-	if el.Value.(*CacheEntry).Data == nil {
-		return nil, false // Data isn't actually in memory, it's just a ghost record
+	entry := el.Value.(*CacheEntry)
+
+	if entry.Data == nil {
+		return nil, false // ghost record in A1out, data isn't in memory
 	}
 
-	// If it's already in Am, mark it as recently used by moving it to the front
-	// Note: We leave A1in items alone until they are pushed out to A1out
-	if c.isAm(el) {
+	// If it's already in Am, mark it as recently used by moving it to the front.
+	// A1in items are left alone until they are pushed out to A1out.
+	if entry.InAm {
 		c.am.MoveToFront(el)
 	}
 
-	return el.Value.(*CacheEntry).Data, true
+	return entry.Data, true
 }
 
 // Put inserts new data, managing capacity and cascading evictions across the queues.
@@ -80,19 +82,20 @@ func (c *TwoQEngine) Put(key string, data []byte) {
 
 	if el, found := c.items[key]; found {
 		entry := el.Value.(*CacheEntry)
-		
-		// If it's a ghost record (A1out), promote it to the hot LRU queue (Am)
+
+		// Ghost record (A1out): promote it to the hot LRU queue (Am)
 		if entry.Data == nil {
 			c.a1out.Remove(el)
 			entry.Data = data
+			entry.InAm = true
 			c.items[key] = c.am.PushFront(entry)
 			c.enforceAmCapacity()
 			return
 		}
 
-		// Update existing hot data
+		// Update existing data
 		entry.Data = data
-		if c.isAm(el) {
+		if entry.InAm {
 			c.am.MoveToFront(el)
 		}
 		return
@@ -122,13 +125,13 @@ func (c *TwoQEngine) enforceA1inCapacity() {
 	for c.a1in.Len() > c.a1inCap {
 		evicted := c.a1in.Back()
 		c.a1in.Remove(evicted)
-		
+
 		// Strip the data to save RAM, but keep the key in the ghost cache (A1out)
 		entry := evicted.Value.(*CacheEntry)
-		entry.Data = nil 
+		entry.Data = nil
 		c.items[entry.Key] = c.a1out.PushFront(entry)
 	}
-	
+
 	// Ensure the ghost cache doesn't grow infinitely
 	for c.a1out.Len() > c.a1outCap {
 		evicted := c.a1out.Back()

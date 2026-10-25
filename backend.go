@@ -20,8 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble"
 	pb "cdcs1/cdcspb"
+	"github.com/cockroachdb/pebble"
 )
 
 const rsTotalShards = 6
@@ -279,6 +279,7 @@ func (b *Backend) saveMeta(fileID string, meta FileMeta) error {
 
 	if err := b.raftApply(cmd); err != nil {
 		fmt.Printf("[Raft] SET_META failed for %s: %v\n", fileID, err)
+		return err
 	}
 
 	return nil
@@ -564,7 +565,7 @@ func (b *Backend) HandlePromoteRaft(w http.ResponseWriter, r *http.Request) {
 			b.mu.Unlock()
 			b.logEvent(fmt.Sprintf("Promoted standby %s to full raft voter", nodeID))
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(fmt.Sprintf("%s promoted to voter", nodeID)))
+			fmt.Fprintf(w, "%s promoted to voter", nodeID)
 			return
 		} else {
 			lastErr = err
@@ -888,7 +889,7 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if header.Size > 1000<<20 {
-		http.Error(w, "File exceeds the 32 MB limit.", http.StatusRequestEntityTooLarge)
+		http.Error(w, "File exceeds the 1GB limit.", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -1054,16 +1055,20 @@ func (b *Backend) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := b.saveMeta(fileID, meta); err != nil {
+		b.deleteFilePermanently(fileID) // roll back shards + local meta
+		b.commitUploadWAL(fileID)
 		http.Error(w, "Consensus failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	b.commitUploadWAL(fileID)
-
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Upload successful"))
 }
-
+func (b *Backend) isKilled(id string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.killedNodes[id]
+}
 func (b *Backend) HandleFiles(w http.ResponseWriter, r *http.Request) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1097,7 +1102,7 @@ func (b *Backend) fetchShardAdaptive(
 	var wg sync.WaitGroup
 
 	for _, nodeID := range nodeIDs {
-		if nodeID == "" || b.killedNodes[nodeID] {
+		if nodeID == "" || b.isKilled(nodeID) {
 			resCh <- result{}
 			continue
 		}
@@ -1309,21 +1314,31 @@ func (b *Backend) HandleView(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Failed to view file", http.StatusInternalServerError)
 }
 
+const touchInterval = int64(3600) // 30-day sweeper, so 1h resolution is enough
+
 func (b *Backend) touchLastAccessed(fileID string) {
+	now := time.Now().Unix()
+
 	b.mu.Lock()
-
 	meta, exists := b.fileMeta[fileID]
-
-	b.mu.Unlock()
-
-	if !exists {
+	if !exists || now-meta.LastAccessed < touchInterval {
+		b.mu.Unlock()
 		return
 	}
+	meta.LastAccessed = now
+	b.fileMeta[fileID] = meta
+	b.mu.Unlock()
 
-	meta.LastAccessed = time.Now().Unix()
-	_ = b.saveMeta(fileID, meta)
+	go func() {
+		b.mu.RLock()
+		latest, ok := b.fileMeta[fileID]
+		b.mu.RUnlock()
+		if !ok {
+			return // deleted meanwhile
+		}
+		_ = b.saveMeta(fileID, latest)
+	}()
 }
-
 func contentTypeFor(name, disposition string) string {
 	if disposition != "inline" {
 		return "application/octet-stream"
