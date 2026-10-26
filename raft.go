@@ -174,38 +174,34 @@ func SetupRaftNode(nodeID, bindAddr, advertiseAddr string, peers map[string]stri
 		return nil, nil, fmt.Errorf("failed to create TCP transport: %w", err)
 	}
 
-	// Storage: durable when RAFT_DATA_DIR is set (log + term/vote in BoltDB,
-	// snapshots as files), otherwise in-memory as before. Persisting means a
-	// restarted node rejoins with its log and current term instead of an empty
-	// state. To wipe a cluster on purpose, delete the data directories.
-	var (
-		logStore      raft.LogStore
-		stableStore   raft.StableStore
-		snapshotStore raft.SnapshotStore
-	)
-
-	if dir := os.Getenv("RAFT_DATA_DIR"); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, nil, fmt.Errorf("failed to create raft data dir %s: %w", dir, err)
-		}
-
-		boltStore, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open raft BoltDB store: %w", err)
-		}
-		logStore, stableStore = boltStore, boltStore
-
-		snapshotStore, err = raft.NewFileSnapshotStore(dir, 2, os.Stderr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to create raft snapshot store: %w", err)
-		}
-	} else {
-		logStore = raft.NewInmemStore()
-		stableStore = raft.NewInmemStore()
-		// Not the discard store: a follower that falls behind a compacted log
-		// needs a snapshot to catch up from, and discard keeps none.
-		snapshotStore = raft.NewInmemSnapshotStore()
+	// Storage is always durable: log + term/vote in BoltDB, snapshots as
+	// files. RAFT_DATA_DIR picks the folder; if unset it defaults to
+	// raft-data/<nodeID> in the working directory. A restarted node rejoins
+	// with its log and current term. To wipe a cluster on purpose, delete
+	// the data directories.
+	dir := os.Getenv("RAFT_DATA_DIR")
+	if dir == "" {
+		dir = filepath.Join("raft-data", nodeID)
 	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("failed to create raft data dir %s: %w", dir, err)
+	}
+
+	boltStore, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open raft BoltDB store: %w", err)
+	}
+
+	snapshotStore, err := raft.NewFileSnapshotStore(dir, 2, os.Stderr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create raft snapshot store: %w", err)
+	}
+
+	var (
+		logStore    raft.LogStore    = boltStore
+		stableStore raft.StableStore = boltStore
+	)
 
 	fsm := NewMetadataFSM()
 

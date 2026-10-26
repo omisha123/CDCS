@@ -16,8 +16,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Container service names. ./cluster.json (LAN IPs) is for the physical PCs.
-      - ./cluster.docker.json:/app/cluster.json
+      # LAN IPs of the physical PCs (single config file).
+      - ./cluster.json:/app/cluster.json
       - ./data/orchestrator:/app/orchestrator-data
     depends_on:
       - node-01
